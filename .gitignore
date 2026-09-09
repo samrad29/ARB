@@ -1,0 +1,27 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.coverage
+htmlcov/
+
+# Local SQLite (WAL sidecars included)
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/*.db-journal
+data/collector_stats.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
