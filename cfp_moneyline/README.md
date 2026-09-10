@@ -1,4 +1,4 @@
-Pull NFL moneyline (game winner) markets from Kalshi and Polymarket, match the same games, and write CSVs.
+Pull college football moneyline (game winner) markets from Kalshi and Polymarket, match the same games, and write CSVs.
 
 ```
 python main.py
