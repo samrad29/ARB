@@ -19,6 +19,7 @@ data/*.db-wal
 data/*.db-shm
 data/*.db-journal
 data/collector_stats.json
+data/discovery_cache.json
 
 # OS / editor
 .DS_Store
