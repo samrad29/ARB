@@ -44,6 +44,12 @@ class Settings(BaseSettings):
     match_candidate_min_score: float = 0.55
     match_high_confidence_min_score: float = 0.82
 
+    candidate_date_tolerance_days: int = 90
+    candidate_lexical_min_score: float = 0.32
+    candidate_strong_lexical_min_score: float = 0.45
+    candidate_min_score: float = 0.20
+    max_candidates_per_market: int = 40
+
     log_level: str = "INFO"
     log_json: bool = False
 

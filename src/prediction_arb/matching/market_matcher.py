@@ -107,6 +107,42 @@ class MarketMatcher:
         results.sort(key=lambda item: item.match_score, reverse=True)
         return results
 
+    def classify_pairs(self, pairs: list[tuple[Market, Market]]) -> list[MarketMatch]:
+        """Score provided candidate pairs with the conservative matcher.
+
+        This does not generate extra pairs and does not change thresholds.
+        """
+        results: list[MarketMatch] = []
+        seen: set[tuple[str, str, str, str]] = set()
+        for left, right in pairs:
+            if left.exchange == right.exchange:
+                continue
+            key = (left.exchange, left.exchange_market_id, right.exchange, right.exchange_market_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            decision = score_pair(extract_fields(left), extract_fields(right))
+            results.append(
+                MarketMatch(
+                    market_a_exchange=left.exchange,
+                    market_a_id=left.exchange_market_id,
+                    market_b_exchange=right.exchange,
+                    market_b_id=right.exchange_market_id,
+                    match_type=decision.match_type,  # type: ignore[arg-type]
+                    match_score=round(decision.score, 4),
+                    verified=False,
+                    reason=" ".join(decision.reasons),
+                    details={
+                        "contradictions": decision.contradictions,
+                        **decision.details,
+                        "left_title": left.title,
+                        "right_title": right.title,
+                    },
+                )
+            )
+        results.sort(key=lambda item: item.match_score, reverse=True)
+        return results
+
     def _match_pair_exchanges(
         self,
         left_markets: list[Market],

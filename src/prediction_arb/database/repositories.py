@@ -40,29 +40,49 @@ class SqliteRepositories:
         now = _utcnow()
         existing = self.get_by_exchange_id(market.exchange, market.exchange_market_id)
         raw = json.dumps(market.raw_data, default=str)
+        tags = json.dumps(market.tags, default=str)
+        topics = json.dumps(market.canonical_topics, default=str)
+        entities = json.dumps([entity.model_dump() for entity in market.entities], default=str)
+        settlements = json.dumps(market.settlement_sources, default=str)
+        classified_at = now if market.canonical_topics or market.entities else None
+        values = (
+            market.ticker,
+            market.title,
+            market.description,
+            market.category,
+            market.status,
+            _dt(market.open_time),
+            _dt(market.close_time),
+            _dt(market.resolution_time),
+            market.resolution_source,
+            raw,
+            market.series_ticker,
+            market.series_title,
+            market.event_ticker,
+            market.event_title,
+            market.subcategory,
+            tags,
+            topics,
+            entities,
+            settlements,
+            market.liquidity,
+            classified_at,
+            now,
+        )
         if existing:
             self.conn.execute(
                 """
                 UPDATE markets SET
                     ticker=?, title=?, description=?, category=?, status=?,
                     open_time=?, close_time=?, resolution_time=?,
-                    resolution_source=?, raw_data=?, updated_at=?
+                    resolution_source=?, raw_data=?,
+                    series_ticker=?, series_title=?, event_ticker=?, event_title=?,
+                    subcategory=?, tags_json=?, topics_json=?, entities_json=?,
+                    settlement_sources_json=?, liquidity=?, classified_at=?,
+                    updated_at=?
                 WHERE id=?
                 """,
-                (
-                    market.ticker,
-                    market.title,
-                    market.description,
-                    market.category,
-                    market.status,
-                    _dt(market.open_time),
-                    _dt(market.close_time),
-                    _dt(market.resolution_time),
-                    market.resolution_source,
-                    raw,
-                    now,
-                    existing["id"],
-                ),
+                values + (existing["id"],),
             )
             return int(existing["id"])
         cursor = self.conn.execute(
@@ -70,22 +90,16 @@ class SqliteRepositories:
             INSERT INTO markets (
                 exchange, exchange_market_id, ticker, title, description,
                 category, status, open_time, close_time, resolution_time,
-                resolution_source, raw_data, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                resolution_source, raw_data, series_ticker, series_title,
+                event_ticker, event_title, subcategory, tags_json, topics_json,
+                entities_json, settlement_sources_json, liquidity, classified_at,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 market.exchange,
                 market.exchange_market_id,
-                market.ticker,
-                market.title,
-                market.description,
-                market.category,
-                market.status,
-                _dt(market.open_time),
-                _dt(market.close_time),
-                _dt(market.resolution_time),
-                market.resolution_source,
-                raw,
+                *values[:-1],
                 now,
                 now,
             ),
@@ -238,6 +252,90 @@ class SqliteRepositories:
             ),
         )
         return int(cursor.lastrowid)
+
+    def replace_candidate_pairs(self, rows: list[dict[str, Any]]) -> None:
+        self.conn.execute("DELETE FROM candidate_pairs")
+        if not rows:
+            return
+        self.conn.executemany(
+            """
+            INSERT INTO candidate_pairs (
+                market_a_id, market_b_id, candidate_score, reasons_json, signals_json,
+                generated_at, matcher_result, matcher_score, matcher_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    row["market_a_id"],
+                    row["market_b_id"],
+                    row["candidate_score"],
+                    row["reasons_json"],
+                    row.get("signals_json"),
+                    row["generated_at"],
+                    row.get("matcher_result"),
+                    row.get("matcher_score"),
+                    row.get("matcher_reason"),
+                )
+                for row in rows
+            ],
+        )
+
+    def list_candidate_pairs(self, limit: int = 50) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT c.*,
+                   ma.exchange AS market_a_exchange,
+                   ma.exchange_market_id AS market_a_exchange_id,
+                   ma.title AS market_a_title,
+                   ma.series_title AS market_a_series,
+                   ma.event_title AS market_a_event,
+                   mb.exchange AS market_b_exchange,
+                   mb.exchange_market_id AS market_b_exchange_id,
+                   mb.title AS market_b_title,
+                   mb.event_title AS market_b_event
+            FROM candidate_pairs c
+            JOIN markets ma ON ma.id = c.market_a_id
+            JOIN markets mb ON mb.id = c.market_b_id
+            ORDER BY c.candidate_score DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def candidate_pair_stats(self) -> dict[str, Any]:
+        total = self.conn.execute("SELECT COUNT(*) AS n FROM candidate_pairs").fetchone()["n"]
+        signal_counts: dict[str, int] = {}
+        for row in self.conn.execute("SELECT signals_json FROM candidate_pairs"):
+            raw = row["signals_json"]
+            if not raw:
+                continue
+            try:
+                signals = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            for signal in signals:
+                signal_counts[str(signal)] = signal_counts.get(str(signal), 0) + 1
+        matcher_rows = self.conn.execute(
+            """
+            SELECT
+                COUNT(*) AS n,
+                SUM(CASE WHEN matcher_score >= 0.55 THEN 1 ELSE 0 END) AS matcher_matches,
+                SUM(
+                    CASE WHEN matcher_result IN ('EXACT', 'LIKELY_EQUIVALENT')
+                              AND matcher_score >= 0.82
+                         THEN 1 ELSE 0 END
+                ) AS high_conf
+            FROM candidate_pairs
+            """
+        ).fetchone()
+        return {
+            "generated": int(total),
+            "unique_pairs": int(total),
+            "by_signal": signal_counts,
+            "matcher_matches": int(matcher_rows["matcher_matches"] or 0),
+            "high_confidence_matches": int(matcher_rows["high_conf"] or 0),
+        }
 
     def list_matches(self, min_score: float | None = None) -> list[dict[str, Any]]:
         sql = "SELECT * FROM market_matches"

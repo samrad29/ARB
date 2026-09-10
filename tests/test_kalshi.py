@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from prediction_arb.exchanges.kalshi import normalize_kalshi_market, normalize_kalshi_orderbook
+from prediction_arb.exchanges.kalshi import (
+    compose_kalshi_title,
+    match_series_ticker,
+    normalize_kalshi_market,
+    normalize_kalshi_orderbook,
+)
 
 
 KALSHI_MARKET = {
@@ -64,3 +69,32 @@ def test_normalize_kalshi_orderbook_complements_asks() -> None:
     assert book.best_size("yes", "ask") == 40
     assert book.best_price("no", "ask") == 54  # 100 - 46
     assert book.best_size("no", "ask") == 25
+
+
+def test_normalize_kalshi_attaches_series_and_event_metadata() -> None:
+    market = normalize_kalshi_market(
+        KALSHI_MARKET,
+        {"title": "Fed September", "category": "Economics", "series_ticker": "KXRATECUT"},
+        {
+            "ticker": "KXRATECUT",
+            "title": "Fed Funds Rate",
+            "category": "Economics",
+            "tags": ["Fed", "Rates"],
+            "settlement_sources": [{"name": "FOMC"}],
+        },
+    )
+    assert market.series_ticker == "KXRATECUT"
+    assert market.series_title == "Fed Funds Rate"
+    assert market.event_title == "Fed September"
+    assert "Fed Funds Rate" in market.title
+    assert "25 bps cut" in market.title
+    assert "Fed" in market.tags
+
+
+def test_compose_and_match_series_ticker() -> None:
+    assert compose_kalshi_title("Oscars", "Best Director 2027", "James Ashcroft", "T") == (
+        "Oscars: Best Director 2027: James Ashcroft"
+    )
+    catalog = {"KXRATECUT": {}, "KXRATECUTLONG": {}}
+    assert match_series_ticker("KXRATECUT-26SEP", catalog) == "KXRATECUT"
+    assert match_series_ticker("KXRATECUTLONG-26SEP", catalog) == "KXRATECUTLONG"

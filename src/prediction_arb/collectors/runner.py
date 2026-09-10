@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -20,7 +21,9 @@ from prediction_arb.config import Settings
 from prediction_arb.database.repositories import SqliteRepositories
 from prediction_arb.exchanges.base import PredictionMarketExchange
 from prediction_arb.logging_utils import log_event
+from prediction_arb.matching.candidates import CandidateGenerator, CandidatePair
 from prediction_arb.matching.market_matcher import MarketMatcher
+from prediction_arb.matching.taxonomy import classify_market
 from prediction_arb.metrics import MetricsRegistry
 from prediction_arb.models.opportunity import ArbitrageOpportunity, MarketMatch
 from prediction_arb.models.orderbook import OrderBook
@@ -32,6 +35,8 @@ logger = logging.getLogger("prediction_arb.collectors")
 class ScanStats:
     markets_by_exchange: dict[str, int] = field(default_factory=dict)
     orderbooks_collected: int = 0
+    generated_candidates: int = 0
+    candidate_signals: dict[str, int] = field(default_factory=dict)
     candidate_matches: int = 0
     high_confidence_matches: int = 0
     opportunities_detected: int = 0
@@ -54,6 +59,7 @@ class CollectorRunner:
         matcher: MarketMatcher | None = None,
         detector: ArbitrageDetector | None = None,
         metrics: MetricsRegistry | None = None,
+        candidate_generator: CandidateGenerator | None = None,
     ) -> None:
         self.settings = settings
         self.repos = repos
@@ -61,6 +67,13 @@ class CollectorRunner:
         self.matcher = matcher or MarketMatcher(
             candidate_min_score=settings.match_candidate_min_score,
             high_confidence_min_score=settings.match_high_confidence_min_score,
+        )
+        self.candidate_generator = candidate_generator or CandidateGenerator(
+            date_tolerance_days=settings.candidate_date_tolerance_days,
+            lexical_min_score=settings.candidate_lexical_min_score,
+            strong_lexical_min_score=settings.candidate_strong_lexical_min_score,
+            min_candidate_score=settings.candidate_min_score,
+            max_candidates_per_market=settings.max_candidates_per_market,
         )
         self.detector = detector or ArbitrageDetector()
         self.metrics = metrics or MetricsRegistry()
@@ -88,6 +101,7 @@ class CollectorRunner:
             "collection_end",
             markets=stats.markets_by_exchange,
             orderbooks_collected=stats.orderbooks_collected,
+            generated_candidates=stats.generated_candidates,
             candidate_matches=stats.candidate_matches,
             high_confidence_matches=stats.high_confidence_matches,
             watchlist_high=stats.watchlist_high,
@@ -142,12 +156,27 @@ class CollectorRunner:
                 continue
             stats.markets_by_exchange[exchange.name] = len(markets)
             for market in markets:
+                classify_market(market)
                 market_id = self.repos.upsert_market(market)
                 self.state.upsert_market(market, market_id)
             self.repos.commit()
 
-        matches = self.matcher.match(list(self.state.markets.values()))
+        candidates, candidate_stats = self.candidate_generator.generate(list(self.state.markets.values()))
+        scored = self.matcher.classify_pairs(
+            [(pair.kalshi_market, pair.polymarket_market) for pair in candidates]
+        )
+        scored_by_key = {
+            (item.market_a_exchange, item.market_a_id, item.market_b_exchange, item.market_b_id): item
+            for item in scored
+        }
+        matches = [
+            item
+            for item in scored
+            if item.match_score >= self.settings.match_candidate_min_score
+        ]
         self.state.matches = matches
+        stats.generated_candidates = candidate_stats.unique_pairs
+        stats.candidate_signals = dict(candidate_stats.by_signal)
         stats.candidate_matches = len(matches)
         stats.high_confidence_matches = sum(
             1
@@ -165,6 +194,7 @@ class CollectorRunner:
             self.state.match_db_ids[
                 (match.market_a_exchange, match.market_a_id, match.market_b_exchange, match.market_b_id)
             ] = row_id
+        self._persist_candidates(candidates, scored_by_key)
         self.repos.commit()
 
         self.state.watchlist = build_watchlist(
@@ -188,6 +218,8 @@ class CollectorRunner:
             "discovery_end",
             duration_seconds=round(time.perf_counter() - started, 3),
             markets=stats.markets_by_exchange,
+            generated_candidates=stats.generated_candidates,
+            candidate_signals=stats.candidate_signals,
             candidate_matches=stats.candidate_matches,
             high_confidence_matches=stats.high_confidence_matches,
             watchlist_high=stats.watchlist_high,
@@ -435,6 +467,46 @@ class CollectorRunner:
         if expired:
             log_event(logger, logging.INFO, "opportunities_expired", count=expired)
         return created, expired
+
+    def _persist_candidates(
+        self,
+        candidates: list[CandidatePair],
+        scored_by_key: dict[tuple[str, str, str, str], MarketMatch],
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        rows: list[dict] = []
+        seen_ids: set[tuple[int, int]] = set()
+        for pair in candidates:
+            a_id = self.state.db_ids.get(("kalshi", pair.kalshi_market.exchange_market_id))
+            b_id = self.state.db_ids.get(("polymarket", pair.polymarket_market.exchange_market_id))
+            if a_id is None or b_id is None:
+                continue
+            low, high = sorted((a_id, b_id))
+            if (low, high) in seen_ids:
+                continue
+            seen_ids.add((low, high))
+            judged = scored_by_key.get(
+                (
+                    pair.kalshi_market.exchange,
+                    pair.kalshi_market.exchange_market_id,
+                    pair.polymarket_market.exchange,
+                    pair.polymarket_market.exchange_market_id,
+                )
+            )
+            rows.append(
+                {
+                    "market_a_id": low,
+                    "market_b_id": high,
+                    "candidate_score": pair.candidate_score,
+                    "reasons_json": json.dumps(pair.reasons, default=str),
+                    "signals_json": json.dumps(list(pair.signals)),
+                    "generated_at": now,
+                    "matcher_result": judged.match_type if judged else None,
+                    "matcher_score": judged.match_score if judged else None,
+                    "matcher_reason": judged.reason if judged else None,
+                }
+            )
+        self.repos.replace_candidate_pairs(rows)
 
     def _write_metrics(self) -> None:
         path = Path(self.settings.metrics_path)

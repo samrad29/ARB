@@ -32,6 +32,7 @@ def test_normalize_polymarket_market() -> None:
     assert market.volume == 1234
     assert market.yes_ask is None  # last/mid prices are not executable asks
     assert "FOMC" in (market.description or "")
+    assert "Economics" in market.tags
 
 
 def test_normalize_clob_book_best_is_top_of_book() -> None:

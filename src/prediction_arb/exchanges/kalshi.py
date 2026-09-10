@@ -49,8 +49,13 @@ def parse_dt(value: Any) -> datetime | None:
     return parsed
 
 
-def normalize_kalshi_market(raw: dict[str, Any], event_meta: dict[str, Any] | None = None) -> Market:
+def normalize_kalshi_market(
+    raw: dict[str, Any],
+    event_meta: dict[str, Any] | None = None,
+    series_meta: dict[str, Any] | None = None,
+) -> Market:
     event_meta = event_meta or {}
+    series_meta = series_meta or {}
     yes_bid = dollars_to_cents(raw.get("yes_bid_dollars")) or None
     yes_ask = dollars_to_cents(raw.get("yes_ask_dollars")) or None
     no_bid = dollars_to_cents(raw.get("no_bid_dollars")) or None
@@ -75,11 +80,16 @@ def normalize_kalshi_market(raw: dict[str, Any], event_meta: dict[str, Any] | No
     no_bid_size = yes_ask_size
 
     event_title = event_meta.get("title")
+    series_title = series_meta.get("title")
     yes_title = raw.get("yes_sub_title") or raw.get("title") or raw.get("ticker")
-    if event_title and yes_title and event_title not in str(yes_title):
-        title = f"{event_title}: {yes_title}"
-    else:
-        title = str(yes_title or raw.get("ticker") or raw.get("event_ticker") or "Kalshi market")
+    title = compose_kalshi_title(series_title, event_title, yes_title, raw.get("ticker"))
+
+    tags = _string_list(series_meta.get("tags") or event_meta.get("tags"))
+    settlement_sources = _settlement_names(
+        series_meta.get("settlement_sources") or event_meta.get("settlement_sources")
+    )
+    if raw.get("rules_primary"):
+        settlement_sources = list(dict.fromkeys(settlement_sources + [str(raw.get("rules_primary"))]))
 
     description_parts = [
         part
@@ -87,24 +97,33 @@ def normalize_kalshi_market(raw: dict[str, Any], event_meta: dict[str, Any] | No
             raw.get("rules_primary"),
             raw.get("rules_secondary"),
             event_meta.get("sub_title"),
+            series_title,
         )
         if part
     ]
     native_status = str(raw.get("status") or "")
+    series_ticker = (
+        series_meta.get("ticker")
+        or event_meta.get("series_ticker")
+        or raw.get("series_ticker")
+    )
+    event_ticker = raw.get("event_ticker") or event_meta.get("ticker") or event_meta.get("event_ticker")
+    close_time = parse_dt(raw.get("close_time"))
+    strike = parse_dt(event_meta.get("strike_date") or event_meta.get("close_time"))
     return Market(
         exchange="kalshi",
         exchange_market_id=str(raw.get("ticker")),
         ticker=raw.get("ticker"),
         title=title,
         description="\n".join(description_parts) or None,
-        category=event_meta.get("category") or raw.get("category"),
+        category=series_meta.get("category") or event_meta.get("category") or raw.get("category"),
         status=_STATUS_MAP.get(native_status.lower(), native_status or "unknown"),
         open_time=parse_dt(raw.get("open_time")),
-        close_time=parse_dt(raw.get("close_time")),
+        close_time=close_time,
         resolution_time=parse_dt(
-            raw.get("expected_expiration_time") or raw.get("latest_expiration_time")
+            raw.get("expected_expiration_time") or raw.get("latest_expiration_time") or event_meta.get("close_time")
         ),
-        resolution_source=raw.get("rules_primary") or event_meta.get("settlement_source"),
+        resolution_source=raw.get("rules_primary") or _first(settlement_sources) or event_meta.get("settlement_source"),
         yes_bid=yes_bid,
         yes_ask=yes_ask,
         no_bid=no_bid,
@@ -118,9 +137,15 @@ def normalize_kalshi_market(raw: dict[str, Any], event_meta: dict[str, Any] | No
         open_interest=floor_quantity(raw.get("open_interest_fp")),
         raw_data=raw,
         updated_at=parse_dt(raw.get("updated_time")),
-        event_date=parse_dt(raw.get("occurrence_datetime") or raw.get("close_time")),
+        event_date=strike or parse_dt(raw.get("occurrence_datetime") or raw.get("close_time")),
         rules_text="\n".join(description_parts) or None,
-        fee_category=event_meta.get("category"),
+        fee_category=series_meta.get("category") or event_meta.get("category"),
+        series_ticker=str(series_ticker) if series_ticker else None,
+        series_title=str(series_title) if series_title else None,
+        event_ticker=str(event_ticker) if event_ticker else None,
+        event_title=str(event_title) if event_title else None,
+        tags=tags,
+        settlement_sources=settlement_sources,
     )
 
 
@@ -163,12 +188,8 @@ class KalshiExchange(PredictionMarketExchange):
 
     async def get_markets(self) -> list[Market]:
         raw_markets = await self._paginate_markets()
-        event_tickers = {
-            str(raw.get("event_ticker"))
-            for raw in raw_markets
-            if raw.get("event_ticker")
-        }
-        events = await self._get_events_by_tickers(event_tickers)
+        series_catalog = await self.get_series_catalog()
+        events = await self.get_open_events()
         markets: list[Market] = []
         for raw in raw_markets:
             ticker = raw.get("ticker")
@@ -179,8 +200,19 @@ class KalshiExchange(PredictionMarketExchange):
             if str(ticker).upper().startswith("KXMVE"):
                 continue
             try:
-                event_meta = events.get(str(raw.get("event_ticker") or ""), {})
-                markets.append(normalize_kalshi_market(raw, event_meta))
+                event_ticker = str(raw.get("event_ticker") or "")
+                event_meta = dict(events.get(event_ticker) or {})
+                series_ticker = (
+                    event_meta.get("series_ticker")
+                    or raw.get("series_ticker")
+                    or match_series_ticker(event_ticker, series_catalog)
+                )
+                series_meta = dict(series_catalog.get(str(series_ticker or ""), {}) or {})
+                if series_ticker and "ticker" not in series_meta:
+                    series_meta["ticker"] = series_ticker
+                if series_ticker and not event_meta.get("series_ticker"):
+                    event_meta["series_ticker"] = series_ticker
+                markets.append(normalize_kalshi_market(raw, event_meta, series_meta))
             except Exception as exc:
                 log_event(
                     logger,
@@ -309,34 +341,164 @@ class KalshiExchange(PredictionMarketExchange):
             await asyncio.sleep(0.2)
         return markets
 
-    async def _get_events_by_tickers(self, tickers: set[str]) -> dict[str, dict[str, Any]]:
-        """Fetch event metadata only for markets we actually collected.
+    async def get_series_catalog(self) -> dict[str, dict[str, Any]]:
+        """GET /series, with category fallback. Series is the candidate-generation unit."""
+        catalog: dict[str, dict[str, Any]] = {}
+        items = await self._fetch_series_list()
+        if not items:
+            categories = await self._series_categories()
+            for category in categories:
+                items.extend(await self._fetch_series_list(category=category))
+                await asyncio.sleep(0.1)
+        for item in items:
+            ticker = item.get("ticker") or item.get("series_ticker")
+            if ticker:
+                catalog[str(ticker)] = item
+        log_event(logger, logging.INFO, "kalshi_series_collected", count=len(catalog))
+        return catalog
 
-        Public unauthenticated traffic is easy to 429 if we paginate every
-        open event. Cap and serialize a bit so one slow endpoint cannot
-        stall the rest of the collector.
-        """
-        selected = sorted(tickers)[:150]
-        semaphore = asyncio.Semaphore(3)
-        results: dict[str, dict[str, Any]] = {}
+    async def get_open_events(self) -> dict[str, dict[str, Any]]:
+        """Paginate GET /events?status=open instead of one request per event ticker."""
+        events: dict[str, dict[str, Any]] = {}
+        cursor: str | None = None
+        while True:
+            params: dict[str, Any] = {"status": "open", "limit": 200, "with_nested_markets": False}
+            if cursor:
+                params["cursor"] = cursor
+            try:
+                data = await self.http.get_json(f"{self.base_url}/events", params=params)
+            except Exception as exc:
+                log_event(
+                    logger,
+                    logging.ERROR,
+                    "kalshi_events_page_failed",
+                    error=type(exc).__name__,
+                    cursor=bool(cursor),
+                )
+                break
+            page = list(data.get("events") or [])
+            for event in page:
+                ticker = event.get("event_ticker") or event.get("ticker")
+                if ticker:
+                    events[str(ticker)] = event
+            cursor = data.get("cursor") or None
+            if not cursor or not page:
+                break
+            if self.max_markets and len(events) >= max(self.max_markets * 2, 200):
+                break
+            await asyncio.sleep(0.15)
+        log_event(logger, logging.INFO, "kalshi_events_collected", count=len(events))
+        return events
 
-        async def fetch(ticker: str) -> None:
-            async with semaphore:
-                try:
-                    data = await self.http.get_json(f"{self.base_url}/events/{ticker}")
-                    event = data.get("event", data)
-                    results[ticker] = event
-                except Exception as exc:
-                    log_event(
-                        logger,
-                        logging.WARNING,
-                        "kalshi_event_fetch_failed",
-                        event_ticker=ticker,
-                        error=type(exc).__name__,
-                    )
+    async def _fetch_series_list(self, category: str | None = None) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {"include_product_metadata": True}
+        if category:
+            params["category"] = category
+        try:
+            data = await self.http.get_json(f"{self.base_url}/series", params=params)
+        except Exception as exc:
+            log_event(
+                logger,
+                logging.WARNING,
+                "kalshi_series_list_failed",
+                error=type(exc).__name__,
+                category=category,
+            )
+            return []
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+        return list(data.get("series") or data.get("data") or [])
 
-        await asyncio.gather(*(fetch(ticker) for ticker in selected))
-        return results
+    async def _series_categories(self) -> list[str]:
+        try:
+            data = await self.http.get_json(f"{self.base_url}/search/tags_by_categories")
+        except Exception as exc:
+            log_event(logger, logging.WARNING, "kalshi_tags_by_categories_failed", error=type(exc).__name__)
+            return [
+                "Politics",
+                "Economics",
+                "Sports",
+                "Crypto",
+                "Climate and Weather",
+                "Science and Technology",
+                "Entertainment",
+                "Financials",
+            ]
+        mapping = data.get("tags_by_categories") or data
+        if isinstance(mapping, dict):
+            return [str(key) for key in mapping.keys()]
+        return []
+
+
+def compose_kalshi_title(
+    series_title: Any,
+    event_title: Any,
+    yes_title: Any,
+    ticker: Any,
+) -> str:
+    yes = str(yes_title or ticker or "Kalshi market")
+    parts: list[str] = []
+    for value in (series_title, event_title):
+        text = str(value).strip() if value else ""
+        if not text:
+            continue
+        haystack = " ".join(parts + [yes]).lower()
+        if text.lower() not in haystack:
+            parts.append(text)
+    if yes.lower() not in " ".join(parts).lower():
+        parts.append(yes)
+    return ": ".join(parts) if parts else yes
+
+
+def match_series_ticker(event_ticker: str, series_catalog: dict[str, dict[str, Any]]) -> str | None:
+    if not event_ticker:
+        return None
+    if event_ticker in series_catalog:
+        return event_ticker
+    best: str | None = None
+    for ticker in series_catalog:
+        if event_ticker.startswith(ticker) and (best is None or len(ticker) > len(best)):
+            best = ticker
+    return best
+
+
+def _string_list(value: Any) -> list[str]:
+    if not value:
+        return []
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",") if part.strip()]
+    if isinstance(value, list):
+        out: list[str] = []
+        for item in value:
+            if isinstance(item, dict):
+                label = item.get("label") or item.get("name") or item.get("tag") or item.get("slug")
+                if label:
+                    out.append(str(label))
+            elif item:
+                out.append(str(item))
+        return out
+    return [str(value)]
+
+
+def _settlement_names(value: Any) -> list[str]:
+    if not value:
+        return []
+    if isinstance(value, str):
+        return [value]
+    names: list[str] = []
+    if isinstance(value, list):
+        for item in value:
+            if isinstance(item, dict):
+                name = item.get("name") or item.get("url") or item.get("source")
+                if name:
+                    names.append(str(name))
+            elif item:
+                names.append(str(item))
+    return names
+
+
+def _first(values: list[str]) -> str | None:
+    return values[0] if values else None
 
 
 def _parse_orderbooks_payload(data: Any) -> dict[str, dict[str, Any]]:

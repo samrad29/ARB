@@ -16,10 +16,26 @@ CREATE TABLE IF NOT EXISTS markets (
     resolution_time TEXT,
     resolution_source TEXT,
     raw_data TEXT,
+    series_ticker TEXT,
+    series_title TEXT,
+    event_ticker TEXT,
+    event_title TEXT,
+    subcategory TEXT,
+    tags_json TEXT,
+    topics_json TEXT,
+    entities_json TEXT,
+    settlement_sources_json TEXT,
+    liquidity INTEGER,
+    classified_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE (exchange, exchange_market_id)
 );
+
+CREATE INDEX IF NOT EXISTS idx_markets_series
+    ON markets (exchange, series_ticker);
+CREATE INDEX IF NOT EXISTS idx_markets_event
+    ON markets (exchange, event_ticker);
 
 CREATE TABLE IF NOT EXISTS market_snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -90,6 +106,27 @@ CREATE TABLE IF NOT EXISTS market_matches (
 
 CREATE INDEX IF NOT EXISTS idx_market_matches_type
     ON market_matches (match_type, match_score);
+
+CREATE TABLE IF NOT EXISTS candidate_pairs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    market_a_id INTEGER NOT NULL,
+    market_b_id INTEGER NOT NULL,
+    candidate_score REAL NOT NULL,
+    reasons_json TEXT NOT NULL,
+    signals_json TEXT,
+    generated_at TEXT NOT NULL,
+    matcher_result TEXT,
+    matcher_score REAL,
+    matcher_reason TEXT,
+    FOREIGN KEY (market_a_id) REFERENCES markets(id),
+    FOREIGN KEY (market_b_id) REFERENCES markets(id),
+    UNIQUE (market_a_id, market_b_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_candidate_pairs_score
+    ON candidate_pairs (candidate_score DESC);
+CREATE INDEX IF NOT EXISTS idx_candidate_pairs_matcher
+    ON candidate_pairs (matcher_result, matcher_score);
 
 CREATE TABLE IF NOT EXISTS arbitrage_opportunities (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

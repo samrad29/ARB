@@ -6,6 +6,11 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 
+class MarketEntity(BaseModel):
+    type: str
+    value: str
+
+
 class Market(BaseModel):
     """Normalized market. Prices are integer cents; sizes are whole contracts."""
 
@@ -41,6 +46,33 @@ class Market(BaseModel):
     yes_token_id: str | None = None
     no_token_id: str | None = None
 
+    series_ticker: str | None = None
+    series_title: str | None = None
+    event_ticker: str | None = None
+    event_title: str | None = None
+    subcategory: str | None = None
+    tags: list[str] = Field(default_factory=list)
+    canonical_topics: list[str] = Field(default_factory=list)
+    entities: list[MarketEntity] = Field(default_factory=list)
+    settlement_sources: list[str] = Field(default_factory=list)
+    liquidity: int | None = None
+
     @property
     def is_active(self) -> bool:
         return (self.status or "").lower() in {"open", "active"}
+
+    def blob(self) -> str:
+        """Text used for topic/entity classification."""
+        parts = [
+            self.title,
+            self.series_title,
+            self.event_title,
+            self.description,
+            self.rules_text,
+            self.category,
+            self.subcategory,
+            self.resolution_source,
+            " ".join(self.tags),
+            " ".join(self.settlement_sources),
+        ]
+        return " ".join(part for part in parts if part)

@@ -17,7 +17,7 @@ from prediction_arb.logging_utils import setup_logging
 from prediction_arb.metrics import MetricsRegistry, format_stats
 from prediction_arb.money import format_cents, format_quantity
 from prediction_arb.rate_limit import RateLimiter
-from prediction_arb.reporting import opportunity_history_report
+from prediction_arb.reporting import candidate_funnel_report, opportunity_history_report
 
 BANNER = """========================================================
 PREDICTION MARKET ARBITRAGE SCANNER
@@ -36,6 +36,7 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser("opportunities", help="Show currently open opportunities")
     sub.add_parser("history", help="Show historical opportunity statistics")
     sub.add_parser("stats", help="Show API / watchlist / WebSocket statistics")
+    sub.add_parser("candidates", help="Show candidate-generation funnel and sample pairs")
     run_parser = sub.add_parser("run", help="Discover slowly; stream/poll the watchlist")
     run_parser.add_argument(
         "--interval",
@@ -61,6 +62,9 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.command == "stats":
         _cmd_stats(settings)
+        return
+    if args.command == "candidates":
+        _cmd_candidates(settings)
         return
     if args.command == "scan":
         asyncio.run(_cmd_scan(settings))
@@ -128,7 +132,9 @@ def _cmd_opportunities(settings: Settings) -> None:
             if row["match_type"] in {"EXACT", "LIKELY_EQUIVALENT"}
             and row["match_score"] >= settings.match_high_confidence_min_score
         ]
-        print(f"Candidate matches:          {len(matches):,}")
+        funnel = repos.candidate_pair_stats()
+        print(f"Generated candidate pairs:  {funnel.get('generated', 0):,}")
+        print(f"Matcher matches:            {len(matches):,}")
         print(f"High-confidence matches:    {len(high):,}")
         print(f"Current opportunities:       {len(rows):,}")
         print()
@@ -157,6 +163,24 @@ def _cmd_stats(settings: Settings) -> None:
         return
     payload = json.loads(path.read_text(encoding="utf-8"))
     print(format_stats(payload))
+
+
+def _cmd_candidates(settings: Settings) -> None:
+    connection, repos = _open_repos(settings)
+    try:
+        stats = repos.candidate_pair_stats()
+        samples = repos.list_candidate_pairs(limit=15)
+        print(BANNER)
+        print()
+        print(
+            candidate_funnel_report(
+                stats,
+                samples,
+                high_confidence_min_score=settings.match_high_confidence_min_score,
+            )
+        )
+    finally:
+        connection.close()
 
 
 async def _cmd_scan(settings: Settings) -> None:
@@ -238,7 +262,13 @@ def _print_scan_stats(settings: Settings, repos: SqliteRepositories, stats: Scan
     for name in settings.exchange_names:
         print(f"  {name.capitalize():<12} {stats.markets_by_exchange.get(name, 0):,}")
     print()
-    print(f"Candidate matches:          {stats.candidate_matches:,}")
+    print(f"Candidate pairs generated:  {stats.generated_candidates:,}")
+    if stats.candidate_signals:
+        print("  By signal:")
+        for name, count in stats.candidate_signals.items():
+            if count:
+                print(f"    {name}: {count:,}")
+    print(f"Matcher matches:            {stats.candidate_matches:,}")
     print(f"High-confidence matches:    {stats.high_confidence_matches:,}")
     print(f"Watchlist (high):           {stats.watchlist_high:,}")
     print(f"Watchlist (candidate):      {stats.watchlist_candidate:,}")

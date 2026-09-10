@@ -109,6 +109,19 @@ def normalize_polymarket_market(raw: dict[str, Any]) -> Market | None:
     )
     volume = floor_quantity(raw.get("volumeNum") or raw.get("volume"))
     liquidity = floor_quantity(raw.get("liquidityNum") or raw.get("liquidity"))
+    tags = _tag_names(raw) + _tag_names(event0)
+    series_ticker = (
+        raw.get("seriesSlug")
+        or event0.get("seriesSlug")
+        or _series_id(raw)
+        or _series_id(event0)
+    )
+    event_ticker = str(event0.get("slug") or event0.get("id") or raw.get("eventSlug") or "") or None
+    event_title = event0.get("title") or event0.get("ticker")
+    subcategory = None
+    if len(tags) > 1:
+        subcategory = tags[1]
+    settlement_sources = [str(resolution)] if resolution else []
 
     return Market(
         exchange="polymarket",
@@ -116,9 +129,9 @@ def normalize_polymarket_market(raw: dict[str, Any]) -> Market | None:
         ticker=raw.get("slug") or raw.get("conditionId") or market_id,
         title=str(question),
         description=raw.get("description"),
-        category=_category_from_raw(raw),
+        category=_category_from_raw(raw) or (tags[0] if tags else None),
         status=status,
-        open_time=parse_dt(raw.get("startDate") or raw.get("start_date") or raw.get("createdAt")),
+        open_time=parse_dt(raw.get("startDate") or raw.get("start_date") or raw.get("createdAt") or event0.get("startDate")),
         close_time=parse_dt(raw.get("endDate") or raw.get("end_date") or event0.get("endDate")),
         resolution_time=parse_dt(raw.get("endDate") or raw.get("umaEndDate") or event0.get("endDate")),
         resolution_source=str(resolution) if resolution else None,
@@ -132,6 +145,14 @@ def normalize_polymarket_market(raw: dict[str, Any]) -> Market | None:
         fee_category=_category_from_raw(raw),
         yes_token_id=yes_token,
         no_token_id=no_token,
+        series_ticker=str(series_ticker) if series_ticker else None,
+        series_title=str(event0.get("seriesTitle") or "") or None,
+        event_ticker=event_ticker,
+        event_title=str(event_title) if event_title else None,
+        subcategory=subcategory,
+        tags=list(dict.fromkeys(tags)),
+        settlement_sources=settlement_sources,
+        liquidity=liquidity,
     )
 
 
@@ -362,6 +383,36 @@ class PolymarketExchange(PredictionMarketExchange):
                 error=type(exc).__name__,
             )
             return None
+
+
+def _tag_names(raw: dict[str, Any]) -> list[str]:
+    tags = raw.get("tags") or []
+    names: list[str] = []
+    if isinstance(tags, list):
+        for tag in tags:
+            if isinstance(tag, dict):
+                label = tag.get("label") or tag.get("slug") or tag.get("name") or tag.get("title")
+                if label:
+                    names.append(str(label))
+            elif tag:
+                names.append(str(tag))
+    if raw.get("category"):
+        names.append(str(raw["category"]))
+    if raw.get("groupItemTitle"):
+        names.append(str(raw["groupItemTitle"]))
+    return list(dict.fromkeys(name for name in names if name))
+
+
+def _series_id(raw: dict[str, Any]) -> str | None:
+    for key in ("seriesSlug", "series_slug", "seriesId", "series_id"):
+        if raw.get(key):
+            return str(raw[key])
+    series = raw.get("series")
+    if isinstance(series, dict):
+        return str(series.get("slug") or series.get("id") or "") or None
+    if isinstance(series, str) and series:
+        return series
+    return None
 
 
 def _extract_keyset_page(data: Any) -> tuple[list[dict[str, Any]], str | None]:
