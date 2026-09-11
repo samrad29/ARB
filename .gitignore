@@ -13,13 +13,15 @@ build/
 .coverage
 htmlcov/
 
-# Local SQLite (WAL sidecars included)
-data/*.db
-data/*.db-wal
-data/*.db-shm
-data/*.db-journal
-data/collector_stats.json
-data/discovery_cache.json
+# Local SQLite
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+moneyline.db
+
+# Old CSV snapshots
+*.csv
 
 # OS / editor
 .DS_Store

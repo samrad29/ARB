@@ -1,320 +1,77 @@
-"""Pull NFL moneyline markets from Kalshi and Polymarket, match them, write CSVs.
+"""Pull NFL and CFB moneyline markets, match them, find arbs, store in SQLite.
 
 Run:  python main.py
 """
 
 from __future__ import annotations
 
-import csv
-import json
-import re
-import time
-import urllib.error
-import urllib.parse
-import urllib.request
-from datetime import datetime, timezone
+import sqlite3
+from pathlib import Path
 
-KALSHI = "https://external-api.kalshi.com/trade-api/v2"
-POLY = "https://gamma-api.polymarket.com"
-KALSHI_SERIES = "KXNFLGAME"
-POLY_NFL_TAG = 450
+from util import parse_game_date
+import cfp_moneyline
+import nfl
 
-# Any token below maps to one canonical team id.
-TEAMS = {
-    "ari": "cardinals", "arizona": "cardinals", "cardinals": "cardinals",
-    "atl": "falcons", "atlanta": "falcons", "falcons": "falcons",
-    "bal": "ravens", "baltimore": "ravens", "ravens": "ravens",
-    "buf": "bills", "buffalo": "bills", "bills": "bills",
-    "car": "panthers", "carolina": "panthers", "panthers": "panthers",
-    "chi": "bears", "chicago": "bears", "bears": "bears",
-    "cin": "bengals", "cincinnati": "bengals", "bengals": "bengals",
-    "cle": "browns", "cleveland": "browns", "browns": "browns",
-    "dal": "cowboys", "dallas": "cowboys", "cowboys": "cowboys",
-    "den": "broncos", "denver": "broncos", "broncos": "broncos",
-    "det": "lions", "detroit": "lions", "lions": "lions",
-    "gb": "packers", "gnb": "packers", "green bay": "packers", "packers": "packers",
-    "hou": "texans", "houston": "texans", "texans": "texans",
-    "ind": "colts", "indianapolis": "colts", "colts": "colts",
-    "jac": "jaguars", "jax": "jaguars", "jacksonville": "jaguars", "jaguars": "jaguars",
-    "kc": "chiefs", "kan": "chiefs", "kansas city": "chiefs", "chiefs": "chiefs",
-    "lv": "raiders", "lvr": "raiders", "las vegas": "raiders", "oakland": "raiders", "raiders": "raiders",
-    "lac": "chargers", "chargers": "chargers", "los angeles chargers": "chargers",
-    "lar": "rams", "rams": "rams", "los angeles rams": "rams", "los angeles r": "rams",
-    "mia": "dolphins", "miami": "dolphins", "dolphins": "dolphins",
-    "min": "vikings", "minnesota": "vikings", "vikings": "vikings",
-    "ne": "patriots", "nwe": "patriots", "new england": "patriots", "patriots": "patriots",
-    "no": "saints", "nor": "saints", "new orleans": "saints", "saints": "saints",
-    "nyg": "giants", "new york g": "giants", "new york giants": "giants", "giants": "giants",
-    "nyj": "jets", "new york j": "jets", "new york jets": "jets", "jets": "jets",
-    "phi": "eagles", "philadelphia": "eagles", "eagles": "eagles",
-    "pit": "steelers", "pittsburgh": "steelers", "steelers": "steelers",
-    "sea": "seahawks", "seattle": "seahawks", "seahawks": "seahawks",
-    "sf": "49ers", "sfo": "49ers", "san francisco": "49ers", "49ers": "49ers", "niners": "49ers",
-    "tb": "buccaneers", "tam": "buccaneers", "tampa": "buccaneers", "tampa bay": "buccaneers",
-    "buccaneers": "buccaneers", "bucs": "buccaneers",
-    "ten": "titans", "tennessee": "titans", "titans": "titans",
-    "was": "commanders", "wsh": "commanders", "washington": "commanders", "commanders": "commanders",
-}
-
-# Longest Kalshi ticker codes first so LAR/LAC/NYG/NYJ beat shorter prefixes.
-KALSHI_CODES = tuple(
-    sorted(
-        {token.upper() for token in TEAMS if token.isalpha() and 2 <= len(token) <= 3},
-        key=len,
-        reverse=True,
-    )
+DB_PATH = Path(__file__).resolve().parent / "moneyline.db"
+DATE_WINDOW_DAYS = 1
+SPORTS = (
+    ("nfl", nfl, "NFL", "pro"),
+    ("cfb", cfp_moneyline, "CFB", "college"),
 )
-GAME_SLUG = re.compile(r"^nfl-[a-z0-9]+-[a-z0-9]+-\d{4}-\d{2}-\d{2}$")
-KALSHI_EVENT = re.compile(r"^KXNFLGAME-(\d{2}[A-Z]{3}\d{2})([A-Z]+)$")
 
 
-def get_json(url: str, params: dict | None = None) -> dict | list:
-    if params:
-        url = url + "?" + urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
-    req = urllib.request.Request(url, headers={"User-Agent": "nfl-moneyline-scanner", "Accept": "application/json"})
-    for attempt in range(6):
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return json.loads(resp.read().decode())
-        except urllib.error.HTTPError as exc:
-            if exc.code != 429 or attempt == 5:
-                raise
-            time.sleep(2 * (attempt + 1))
-    raise RuntimeError(f"failed {url}")
-
-
-def team_id(text: str | None) -> str | None:
-    if not text:
-        return None
-    raw = re.sub(r"[^a-z0-9 ]+", " ", text.lower()).strip()
-    if raw in TEAMS:
-        return TEAMS[raw]
-    raw = re.sub(r"\s+", " ", raw)
-    if raw in TEAMS:
-        return TEAMS[raw]
-    return TEAMS.get(raw.replace(" ", ""))
-
-
-def parse_price(value) -> float | None:
-    if value in (None, ""):
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def parse_dt(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    text = str(value).replace("Z", "+00:00")
-    try:
-        dt = datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
-
-
-def fetch_kalshi() -> list[dict]:
-    rows: list[dict] = []
-    cursor = None
-    while True:
-        data = get_json(
-            f"{KALSHI}/events",
-            {
-                "series_ticker": KALSHI_SERIES,
-                "status": "open",
-                "with_nested_markets": "true",
-                "limit": 200,
-                "cursor": cursor,
-            },
-        )
-        for event in data.get("events") or []:
-            rows.extend(_kalshi_event(event))
-        cursor = data.get("cursor") or None
-        if not cursor:
-            break
-    return rows
-
-
-def _kalshi_event(event: dict) -> list[dict]:
-    event_ticker = event.get("event_ticker") or ""
-    title = event.get("title") or event_ticker
-    parsed = _parse_kalshi_event_ticker(event_ticker)
-    event_teams = parsed["teams"] if parsed else []
-    game_date = parsed["date"] if parsed else None
-    markets = event.get("markets") or []
-    out = []
-    for market in markets:
-        team = team_id(market.get("ticker", "").rsplit("-", 1)[-1]) or team_id(market.get("yes_sub_title"))
-        if not team:
-            continue
-        opponent = next((other for other in event_teams if other != team), None)
-        if opponent is None:
-            others = [team_id(m.get("ticker", "").rsplit("-", 1)[-1]) for m in markets]
-            opponent = next((other for other in others if other and other != team), None)
-        close = parse_dt(market.get("close_time") or market.get("expected_expiration_time"))
-        out.append(
-            {
-                "exchange": "kalshi",
-                "market_id": market.get("ticker"),
-                "event_id": event_ticker,
-                "event_title": title,
-                "team": team,
-                "opponent": opponent or "",
-                "yes_price": parse_price(market.get("yes_ask_dollars") or market.get("last_price_dollars")),
-                "volume": parse_price(market.get("volume_fp")),
-                "close_time": close.isoformat() if close else "",
-                "url": f"https://kalshi.com/markets/{KALSHI_SERIES.lower()}/{str(event_ticker).lower()}",
-            }
-        )
-    if not game_date:
-        first_close = next((parse_dt(m.get("close_time")) for m in markets if m.get("close_time")), None)
-        game_date = first_close.date().isoformat() if first_close else ""
-    for row in out:
-        row["game_date"] = game_date or ""
-    return out
-
-
-def _parse_kalshi_event_ticker(ticker: str) -> dict | None:
-    match = KALSHI_EVENT.match(ticker or "")
-    if not match:
-        return None
-    date_raw, rest = match.group(1), match.group(2)
-    try:
-        game_date = datetime.strptime(date_raw, "%y%b%d").date().isoformat()
-    except ValueError:
-        game_date = ""
-    teams = []
-    leftover = rest
-    while leftover:
-        code = next((c for c in KALSHI_CODES if leftover.startswith(c)), None)
-        if not code:
-            break
-        mapped = team_id(code)
-        if mapped:
-            teams.append(mapped)
-        leftover = leftover[len(code) :]
-    return {"date": game_date, "teams": teams}
-
-
-def fetch_polymarket() -> list[dict]:
-    rows: list[dict] = []
-    offset = 0
-    while True:
-        events = get_json(
-            f"{POLY}/events",
-            {
-                "tag_id": POLY_NFL_TAG,
-                "active": "true",
-                "closed": "false",
-                "limit": 100,
-                "offset": offset,
-            },
-        )
-        if not isinstance(events, list) or not events:
-            break
-        for event in events:
-            slug = event.get("slug") or ""
-            sport = event.get("sport") or {}
-            sport_slug = sport.get("sport") if isinstance(sport, dict) else sport
-            if sport_slug != "nfl" or not GAME_SLUG.match(slug):
-                continue
-            rows.extend(_poly_event(event))
-        offset += len(events)
-        if len(events) < 100:
-            break
-    return rows
-
-
-def _poly_event(event: dict) -> list[dict]:
-    slug = event.get("slug") or ""
-    title = event.get("title") or slug
-    teams = []
-    for item in event.get("teams") or []:
-        mapped = team_id(item.get("alias")) or team_id(item.get("name")) or team_id(item.get("abbreviation"))
-        if mapped:
-            teams.append(mapped)
-    moneyline = next(
-        (m for m in (event.get("markets") or []) if m.get("sportsMarketType") == "moneyline" and not m.get("closed")),
-        None,
-    )
-    if not moneyline:
-        return []
-    outcomes = _maybe_json(moneyline.get("outcomes")) or []
-    prices = _maybe_json(moneyline.get("outcomePrices")) or []
-    close = parse_dt(moneyline.get("endDate") or event.get("endDate") or event.get("startDate"))
-    game_date = close.date().isoformat() if close else ""
-    date_from_slug = re.search(r"(\d{4}-\d{2}-\d{2})$", slug)
-    if date_from_slug:
-        game_date = date_from_slug.group(1)
-    volume = parse_price(moneyline.get("volume"))
-    out = []
-    for i, outcome in enumerate(outcomes):
-        team = team_id(str(outcome))
-        if not team:
-            continue
-        opponent = next((other for other in teams if other != team), "")
-        if not opponent:
-            others = [team_id(str(o)) for o in outcomes]
-            opponent = next((other for other in others if other and other != team), "") or ""
-        price = parse_price(prices[i] if i < len(prices) else None)
-        out.append(
-            {
-                "exchange": "polymarket",
-                "market_id": moneyline.get("id") or moneyline.get("slug") or slug,
-                "event_id": slug,
-                "event_title": title,
-                "team": team,
-                "opponent": opponent,
-                "yes_price": price,
-                "volume": volume,
-                "close_time": close.isoformat() if close else "",
-                "game_date": game_date,
-                "url": f"https://polymarket.com/event/{slug}",
-            }
-        )
-    return out
-
-
-def _maybe_json(value):
-    if isinstance(value, str):
-        try:
-            return json.loads(value)
-        except json.JSONDecodeError:
-            return value
-    return value
-
-
-def match_markets(kalshi: list[dict], poly: list[dict]) -> list[dict]:
-    def by_game(rows: list[dict]) -> dict[frozenset, dict]:
-        games: dict[frozenset, dict] = {}
+def match_markets(kalshi: list[dict], poly: list[dict], sport: str, level: str) -> list[dict]:
+    def by_game(rows: list[dict]) -> dict[tuple, dict]:
+        games: dict[tuple, dict] = {}
         for row in rows:
             if not row["team"] or not row["opponent"]:
                 continue
-            key = frozenset({row["team"], row["opponent"]})
-            game = games.setdefault(key, {"prices": {}, "meta": row})
+            game_date = parse_game_date(row.get("game_date"))
+            if game_date is None:
+                continue
+            teams = frozenset({row["team"], row["opponent"]})
+            key = (teams, game_date)
+            game = games.setdefault(key, {"prices": {}, "meta": row, "date": game_date, "teams": teams})
             game["prices"][row["team"]] = row
         return games
 
     kalshi_games = by_game(kalshi)
     poly_games = by_game(poly)
+    used_poly: set[tuple] = set()
     matches = []
-    for key, k_game in kalshi_games.items():
-        p_game = poly_games.get(key)
-        if not p_game:
+    for (teams, k_date), k_game in kalshi_games.items():
+        candidates = []
+        for (p_teams, p_date), p_game in poly_games.items():
+            if p_teams != teams:
+                continue
+            delta = abs((p_date - k_date).days)
+            if delta <= DATE_WINDOW_DAYS:
+                candidates.append((delta, p_date, p_game))
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        picked = None
+        for _delta, p_date, p_game in candidates:
+            poly_key = (teams, p_date)
+            if poly_key in used_poly:
+                continue
+            used_poly.add(poly_key)
+            picked = (p_date, p_game)
+            break
+        if picked is None:
             continue
-        teams = sorted(key)
-        k_a = k_game["prices"].get(teams[0], {})
-        k_b = k_game["prices"].get(teams[1], {})
-        p_a = p_game["prices"].get(teams[0], {})
-        p_b = p_game["prices"].get(teams[1], {})
+        p_date, p_game = picked
+        names = sorted(teams)
+        k_a = k_game["prices"].get(names[0], {})
+        k_b = k_game["prices"].get(names[1], {})
+        p_a = p_game["prices"].get(names[0], {})
+        p_b = p_game["prices"].get(names[1], {})
         matches.append(
             {
-                "team_a": teams[0],
-                "team_b": teams[1],
+                "sport": sport,
+                "level": level,
+                "game_date": k_date.isoformat(),
+                "poly_game_date": p_date.isoformat(),
+                "team_a": names[0],
+                "team_b": names[1],
                 "kalshi_event": k_game["meta"].get("event_title"),
                 "polymarket_event": p_game["meta"].get("event_title"),
                 "kalshi_yes_a": k_a.get("yes_price"),
@@ -325,71 +82,205 @@ def match_markets(kalshi: list[dict], poly: list[dict]) -> list[dict]:
                 "polymarket_url": p_game["meta"].get("url"),
             }
         )
-    matches.sort(key=lambda row: (row["team_a"], row["team_b"]))
+    matches.sort(key=lambda row: (row["game_date"], row["team_a"], row["team_b"]))
     return matches
 
 
-def write_csv(path: str, rows: list[dict], fieldnames: list[str]) -> None:
-    with open(path, "w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(rows)
+def find_arbs(matches: list[dict]) -> list[dict]:
+    """Buy YES on team A at one venue and YES on team B at the other. If that costs < $1, it is an arb."""
+    rows = []
+    for match in matches:
+        kalshi_a = match.get("kalshi_yes_a")
+        poly_a = match.get("poly_yes_a")
+        kalshi_b = match.get("kalshi_yes_b")
+        poly_b = match.get("poly_yes_b")
+        if None in (kalshi_a, poly_a, kalshi_b, poly_b):
+            continue
+        kalshi_a_poly_b = kalshi_a + poly_b
+        poly_a_kalshi_b = poly_a + kalshi_b
+        if kalshi_a_poly_b <= poly_a_kalshi_b:
+            best_cost = kalshi_a_poly_b
+            best_trade = f"buy {match['team_a']} Kalshi YES + {match['team_b']} Polymarket YES"
+        else:
+            best_cost = poly_a_kalshi_b
+            best_trade = f"buy {match['team_a']} Polymarket YES + {match['team_b']} Kalshi YES"
+        edge = 1.0 - best_cost
+        rows.append(
+            {
+                **match,
+                "team_a_price_diff": round(poly_a - kalshi_a, 4),
+                "team_b_price_diff": round(poly_b - kalshi_b, 4),
+                "kalshi_a_plus_poly_b": round(kalshi_a_poly_b, 4),
+                "poly_a_plus_kalshi_b": round(poly_a_kalshi_b, 4),
+                "best_cost": round(best_cost, 4),
+                "best_edge": round(edge, 4),
+                "is_arb": 1 if edge > 0 else 0,
+                "best_trade": best_trade,
+            }
+        )
+    rows.sort(key=lambda row: row["best_edge"], reverse=True)
+    return rows
+
+
+def connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS markets (
+            sport TEXT NOT NULL,
+            level TEXT NOT NULL,
+            exchange TEXT NOT NULL,
+            market_id TEXT NOT NULL,
+            event_id TEXT,
+            event_title TEXT,
+            team TEXT NOT NULL,
+            opponent TEXT,
+            yes_price REAL,
+            volume REAL,
+            game_date TEXT,
+            close_time TEXT,
+            url TEXT,
+            PRIMARY KEY (sport, exchange, market_id, team)
+        );
+        CREATE TABLE IF NOT EXISTS matches (
+            sport TEXT NOT NULL,
+            level TEXT NOT NULL,
+            game_date TEXT NOT NULL,
+            poly_game_date TEXT,
+            team_a TEXT NOT NULL,
+            team_b TEXT NOT NULL,
+            kalshi_event TEXT,
+            polymarket_event TEXT,
+            kalshi_yes_a REAL,
+            poly_yes_a REAL,
+            kalshi_yes_b REAL,
+            poly_yes_b REAL,
+            kalshi_url TEXT,
+            polymarket_url TEXT,
+            PRIMARY KEY (sport, game_date, team_a, team_b)
+        );
+        CREATE TABLE IF NOT EXISTS arbs (
+            sport TEXT NOT NULL,
+            level TEXT NOT NULL,
+            game_date TEXT NOT NULL,
+            poly_game_date TEXT,
+            team_a TEXT NOT NULL,
+            team_b TEXT NOT NULL,
+            kalshi_event TEXT,
+            polymarket_event TEXT,
+            kalshi_yes_a REAL,
+            poly_yes_a REAL,
+            team_a_price_diff REAL,
+            kalshi_yes_b REAL,
+            poly_yes_b REAL,
+            team_b_price_diff REAL,
+            kalshi_a_plus_poly_b REAL,
+            poly_a_plus_kalshi_b REAL,
+            best_cost REAL,
+            best_edge REAL,
+            is_arb INTEGER,
+            best_trade TEXT,
+            kalshi_url TEXT,
+            polymarket_url TEXT,
+            PRIMARY KEY (sport, game_date, team_a, team_b)
+        );
+        CREATE INDEX IF NOT EXISTS idx_markets_sport ON markets (sport, level);
+        CREATE INDEX IF NOT EXISTS idx_matches_sport ON matches (sport, level);
+        CREATE INDEX IF NOT EXISTS idx_arbs_sport ON arbs (sport, level, is_arb, best_edge);
+        """
+    )
+    return conn
+
+
+def save_db(markets: list[dict], matches: list[dict], arbs: list[dict]) -> None:
+    conn = connect()
+    try:
+        conn.execute("DELETE FROM markets")
+        conn.execute("DELETE FROM matches")
+        conn.execute("DELETE FROM arbs")
+        conn.executemany(
+            """
+            INSERT INTO markets (
+                sport, level, exchange, market_id, event_id, event_title, team, opponent,
+                yes_price, volume, game_date, close_time, url
+            ) VALUES (
+                :sport, :level, :exchange, :market_id, :event_id, :event_title, :team, :opponent,
+                :yes_price, :volume, :game_date, :close_time, :url
+            )
+            """,
+            markets,
+        )
+        conn.executemany(
+            """
+            INSERT INTO matches (
+                sport, level, game_date, poly_game_date, team_a, team_b, kalshi_event, polymarket_event,
+                kalshi_yes_a, poly_yes_a, kalshi_yes_b, poly_yes_b, kalshi_url, polymarket_url
+            ) VALUES (
+                :sport, :level, :game_date, :poly_game_date, :team_a, :team_b, :kalshi_event, :polymarket_event,
+                :kalshi_yes_a, :poly_yes_a, :kalshi_yes_b, :poly_yes_b, :kalshi_url, :polymarket_url
+            )
+            """,
+            matches,
+        )
+        conn.executemany(
+            """
+            INSERT INTO arbs (
+                sport, level, game_date, poly_game_date, team_a, team_b, kalshi_event, polymarket_event,
+                kalshi_yes_a, poly_yes_a, team_a_price_diff, kalshi_yes_b, poly_yes_b, team_b_price_diff,
+                kalshi_a_plus_poly_b, poly_a_plus_kalshi_b, best_cost, best_edge, is_arb, best_trade,
+                kalshi_url, polymarket_url
+            ) VALUES (
+                :sport, :level, :game_date, :poly_game_date, :team_a, :team_b, :kalshi_event, :polymarket_event,
+                :kalshi_yes_a, :poly_yes_a, :team_a_price_diff, :kalshi_yes_b, :poly_yes_b, :team_b_price_diff,
+                :kalshi_a_plus_poly_b, :poly_a_plus_kalshi_b, :best_cost, :best_edge, :is_arb, :best_trade,
+                :kalshi_url, :polymarket_url
+            )
+            """,
+            arbs,
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def main() -> None:
-    print("Fetching Kalshi NFL moneylines (KXNFLGAME)...")
-    kalshi = fetch_kalshi()
-    print(f"  {len(kalshi)} team-win contracts")
+    all_markets: list[dict] = []
+    all_matches: list[dict] = []
+    all_arbs: list[dict] = []
 
-    print("Fetching Polymarket NFL moneylines...")
-    poly = fetch_polymarket()
-    print(f"  {len(poly)} team-win outcomes")
+    for sport, module, label, level in SPORTS:
+        print(f"Fetching Kalshi {label} moneylines...")
+        kalshi = module.fetch_kalshi()
+        print(f"  {len(kalshi)} team-win contracts")
+        print(f"Fetching Polymarket {label} moneylines...")
+        poly = module.fetch_polymarket()
+        print(f"  {len(poly)} team-win outcomes")
+        matches = match_markets(kalshi, poly, sport, level)
+        arbs = find_arbs(matches)
+        all_markets.extend(kalshi + poly)
+        all_matches.extend(matches)
+        all_arbs.extend(arbs)
 
-    markets = kalshi + poly
-    matches = match_markets(kalshi, poly)
-
-    write_csv(
-        "markets.csv",
-        markets,
-        [
-            "exchange",
-            "market_id",
-            "event_id",
-            "event_title",
-            "team",
-            "opponent",
-            "yes_price",
-            "volume",
-            "game_date",
-            "close_time",
-            "url",
-        ],
-    )
-    write_csv(
-        "matches.csv",
-        matches,
-        [
-            "team_a",
-            "team_b",
-            "kalshi_event",
-            "polymarket_event",
-            "kalshi_yes_a",
-            "poly_yes_a",
-            "kalshi_yes_b",
-            "poly_yes_b",
-            "kalshi_url",
-            "polymarket_url",
-        ],
-    )
-    print(f"Wrote markets.csv ({len(markets)} rows) and matches.csv ({len(matches)} matched games)")
-    for row in matches[:12]:
+    save_db(all_markets, all_matches, all_arbs)
+    hits = [row for row in all_arbs if row["is_arb"]]
+    print(f"Wrote {DB_PATH.name}: {len(all_markets)} markets, {len(all_matches)} matches, {len(hits)} arbs / {len(all_arbs)} compared")
+    for row in all_matches[:8]:
         print(
-            f"  {row['team_a']} vs {row['team_b']}: "
+            f"  [{row['sport']}] {row['game_date']} {row['team_a']} vs {row['team_b']}: "
             f"Kalshi {row['kalshi_yes_a']}/{row['kalshi_yes_b']}  "
             f"Poly {row['poly_yes_a']}/{row['poly_yes_b']}"
         )
-    if len(matches) > 12:
-        print(f"  ... {len(matches) - 12} more")
+    if len(all_matches) > 8:
+        print(f"  ... {len(all_matches) - 8} more")
+    if hits:
+        print("Arbs (pre-fee):")
+        for row in hits[:12]:
+            print(f"  [{row['sport']}] {row['game_date']} {row['best_trade']}  cost={row['best_cost']} edge={row['best_edge']}")
+        if len(hits) > 12:
+            print(f"  ... {len(hits) - 12} more")
+    else:
+        print("No pre-fee arbs this run (best edges are in the arbs table).")
 
 
 if __name__ == "__main__":
