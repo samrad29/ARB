@@ -302,22 +302,37 @@ def connect() -> sqlite3.Connection:
     return conn
 
 
+def _dedupe(rows: list[dict], keys: tuple[str, ...], label: str) -> list[dict]:
+    unique: dict[tuple, dict] = {}
+    for row in rows:
+        unique[tuple(row.get(name) for name in keys)] = row
+    dropped = len(rows) - len(unique)
+    if dropped:
+        print(f"Dropped {dropped} duplicate {label}")
+    return list(unique.values())
+
+
 def save_db(markets: list[dict], matches: list[dict], arbs: list[dict]) -> None:
     conn = connect()
     observed_at = datetime.now(timezone.utc).isoformat()
+    for row in markets:
+        row.setdefault("live", 0)
+        row.setdefault("ended", 0)
+        if row.get("market_id") is not None:
+            row["market_id"] = str(row["market_id"])
+    for row in matches:
+        row.setdefault("live", 0)
+        row.setdefault("ended", 0)
+    for row in arbs:
+        row.setdefault("live", 0)
+        row.setdefault("ended", 0)
+    markets = _dedupe(markets, ("sport", "exchange", "market_id", "team"), "markets")
+    matches = _dedupe(matches, ("sport", "game_date", "team_a", "team_b"), "matches")
+    arbs = _dedupe(arbs, ("sport", "game_date", "team_a", "team_b"), "arbs")
     try:
         conn.execute("DELETE FROM markets")
         conn.execute("DELETE FROM matches")
         conn.execute("DELETE FROM arbs")
-        for row in markets:
-            row.setdefault("live", 0)
-            row.setdefault("ended", 0)
-        for row in matches:
-            row.setdefault("live", 0)
-            row.setdefault("ended", 0)
-        for row in arbs:
-            row.setdefault("live", 0)
-            row.setdefault("ended", 0)
         conn.executemany(
             """
             INSERT INTO markets (

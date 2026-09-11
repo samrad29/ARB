@@ -199,8 +199,12 @@ def main() -> None:
                 break
             if time.monotonic() - last_discovery >= DISCOVERY_SECONDS:
                 print("Rediscovering markets...")
-                discover()
-                last_discovery = time.monotonic()
+                try:
+                    discover()
+                    last_discovery = time.monotonic()
+                except Exception as exc:
+                    last_discovery = time.monotonic()
+                    print(f"Discovery failed ({exc}); continuing with existing matches")
                 if deadline is not None and time.monotonic() >= deadline:
                     print("Time limit reached.")
                     break

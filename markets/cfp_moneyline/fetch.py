@@ -86,6 +86,7 @@ def _row(payload: dict) -> dict:
 
 def fetch_kalshi() -> list[dict]:
     rows: list[dict] = []
+    seen: set[str] = set()
     cursor = None
     while True:
         data = get_json(
@@ -99,6 +100,11 @@ def fetch_kalshi() -> list[dict]:
             },
         )
         for event in data.get("events") or []:
+            ticker = event.get("event_ticker") or ""
+            if ticker and ticker in seen:
+                continue
+            if ticker:
+                seen.add(ticker)
             rows.extend(_kalshi_event(event))
         cursor = data.get("cursor") or None
         if not cursor:
@@ -147,6 +153,7 @@ def _kalshi_event(event: dict) -> list[dict]:
 
 def fetch_polymarket() -> list[dict]:
     rows: list[dict] = []
+    seen: set[str] = set()
     offset = 0
     while True:
         events = get_json(
@@ -163,10 +170,14 @@ def fetch_polymarket() -> list[dict]:
             break
         for event in events:
             slug = event.get("slug") or ""
+            event_key = str(event.get("id") or slug)
             meta = event.get("sport") or {}
             sport_slug = meta.get("sport") if isinstance(meta, dict) else meta
             if sport_slug != SPORT or not GAME_SLUG.match(slug):
                 continue
+            if event_key in seen:
+                continue
+            seen.add(event_key)
             rows.extend(_poly_event(event))
         offset += len(events)
         if len(events) < 100:
@@ -198,10 +209,12 @@ def _poly_event(event: dict) -> list[dict]:
     volume = parse_price(moneyline.get("volume"))
     state = poly_game_state(event)
     out = []
+    seen_teams: set[str] = set()
     for i, outcome in enumerate(outcomes):
         team = team_id(str(outcome))
-        if not team:
+        if not team or team in seen_teams:
             continue
+        seen_teams.add(team)
         opponent = next((other for other in teams if other != team), "")
         if not opponent:
             others = [team_id(str(o)) for o in outcomes]
