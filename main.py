@@ -1,16 +1,17 @@
 """Pull NFL and CFB moneyline markets, match them, find arbs, store in SQLite.
 
 Run:  python main.py
+Poll: python -m polling
 """
 
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 
 from util import parse_game_date
-import cfp_moneyline
-import nfl
+from markets import cfp_moneyline, nfl
 
 DB_PATH = Path(__file__).resolve().parent / "moneyline.db"
 DATE_WINDOW_DAYS = 1
@@ -74,6 +75,11 @@ def match_markets(kalshi: list[dict], poly: list[dict], sport: str, level: str) 
                 "team_b": names[1],
                 "kalshi_event": k_game["meta"].get("event_title"),
                 "polymarket_event": p_game["meta"].get("event_title"),
+                "kalshi_event_id": k_game["meta"].get("event_id"),
+                "kalshi_id_a": k_a.get("market_id"),
+                "kalshi_id_b": k_b.get("market_id"),
+                "poly_id": p_a.get("market_id") or p_b.get("market_id"),
+                "poly_event_id": p_game["meta"].get("event_id"),
                 "kalshi_yes_a": k_a.get("yes_price"),
                 "poly_yes_a": p_a.get("yes_price"),
                 "kalshi_yes_b": k_b.get("yes_price"),
@@ -120,6 +126,13 @@ def find_arbs(matches: list[dict]) -> list[dict]:
         )
     rows.sort(key=lambda row: row["best_edge"], reverse=True)
     return rows
+
+
+def _add_columns(conn: sqlite3.Connection, table: str, columns: list[tuple[str, str]]) -> None:
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    for name, spec in columns:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {spec}")
 
 
 def connect() -> sqlite3.Connection:
@@ -185,16 +198,75 @@ def connect() -> sqlite3.Connection:
             polymarket_url TEXT,
             PRIMARY KEY (sport, game_date, team_a, team_b)
         );
+        CREATE TABLE IF NOT EXISTS price_ticks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            observed_at TEXT NOT NULL,
+            sport TEXT,
+            level TEXT,
+            game_date TEXT,
+            team_a TEXT,
+            team_b TEXT,
+            kalshi_yes_a REAL,
+            poly_yes_a REAL,
+            kalshi_yes_b REAL,
+            poly_yes_b REAL,
+            best_cost REAL,
+            best_edge REAL,
+            is_arb INTEGER,
+            best_trade TEXT,
+            closed INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS arb_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            observed_at TEXT NOT NULL,
+            source TEXT,
+            sport TEXT,
+            level TEXT,
+            game_date TEXT,
+            poly_game_date TEXT,
+            team_a TEXT,
+            team_b TEXT,
+            kalshi_event TEXT,
+            polymarket_event TEXT,
+            kalshi_yes_a REAL,
+            poly_yes_a REAL,
+            team_a_price_diff REAL,
+            kalshi_yes_b REAL,
+            poly_yes_b REAL,
+            team_b_price_diff REAL,
+            kalshi_a_plus_poly_b REAL,
+            poly_a_plus_kalshi_b REAL,
+            best_cost REAL,
+            best_edge REAL,
+            is_arb INTEGER,
+            best_trade TEXT,
+            kalshi_url TEXT,
+            polymarket_url TEXT
+        );
         CREATE INDEX IF NOT EXISTS idx_markets_sport ON markets (sport, level);
         CREATE INDEX IF NOT EXISTS idx_matches_sport ON matches (sport, level);
         CREATE INDEX IF NOT EXISTS idx_arbs_sport ON arbs (sport, level, is_arb, best_edge);
+        CREATE INDEX IF NOT EXISTS idx_price_ticks_time ON price_ticks (observed_at);
+        CREATE INDEX IF NOT EXISTS idx_arb_history_time ON arb_history (observed_at, is_arb);
         """
+    )
+    _add_columns(
+        conn,
+        "matches",
+        [
+            ("kalshi_event_id", "TEXT"),
+            ("kalshi_id_a", "TEXT"),
+            ("kalshi_id_b", "TEXT"),
+            ("poly_id", "TEXT"),
+            ("poly_event_id", "TEXT"),
+        ],
     )
     return conn
 
 
 def save_db(markets: list[dict], matches: list[dict], arbs: list[dict]) -> None:
     conn = connect()
+    observed_at = datetime.now(timezone.utc).isoformat()
     try:
         conn.execute("DELETE FROM markets")
         conn.execute("DELETE FROM matches")
@@ -215,9 +287,11 @@ def save_db(markets: list[dict], matches: list[dict], arbs: list[dict]) -> None:
             """
             INSERT INTO matches (
                 sport, level, game_date, poly_game_date, team_a, team_b, kalshi_event, polymarket_event,
+                kalshi_event_id, kalshi_id_a, kalshi_id_b, poly_id, poly_event_id,
                 kalshi_yes_a, poly_yes_a, kalshi_yes_b, poly_yes_b, kalshi_url, polymarket_url
             ) VALUES (
                 :sport, :level, :game_date, :poly_game_date, :team_a, :team_b, :kalshi_event, :polymarket_event,
+                :kalshi_event_id, :kalshi_id_a, :kalshi_id_b, :poly_id, :poly_event_id,
                 :kalshi_yes_a, :poly_yes_a, :kalshi_yes_b, :poly_yes_b, :kalshi_url, :polymarket_url
             )
             """,
@@ -239,16 +313,54 @@ def save_db(markets: list[dict], matches: list[dict], arbs: list[dict]) -> None:
             """,
             arbs,
         )
+        hits = [row for row in arbs if row.get("is_arb")]
+        for row in hits:
+            conn.execute(
+                """
+                INSERT INTO arb_history (
+                    observed_at, source, sport, level, game_date, poly_game_date, team_a, team_b,
+                    kalshi_event, polymarket_event, kalshi_yes_a, poly_yes_a, team_a_price_diff,
+                    kalshi_yes_b, poly_yes_b, team_b_price_diff, kalshi_a_plus_poly_b, poly_a_plus_kalshi_b,
+                    best_cost, best_edge, is_arb, best_trade, kalshi_url, polymarket_url
+                ) VALUES (
+                    :observed_at, :source, :sport, :level, :game_date, :poly_game_date, :team_a, :team_b,
+                    :kalshi_event, :polymarket_event, :kalshi_yes_a, :poly_yes_a, :team_a_price_diff,
+                    :kalshi_yes_b, :poly_yes_b, :team_b_price_diff, :kalshi_a_plus_poly_b, :poly_a_plus_kalshi_b,
+                    :best_cost, :best_edge, :is_arb, :best_trade, :kalshi_url, :polymarket_url
+                )
+                """,
+                {**row, "observed_at": observed_at, "source": "discovery"},
+            )
         conn.commit()
     finally:
         conn.close()
 
 
-def main() -> None:
+def print_summary(markets: list[dict], matches: list[dict], arbs: list[dict]) -> None:
+    hits = [row for row in arbs if row["is_arb"]]
+    print(f"Wrote {DB_PATH.name}: {len(markets)} markets, {len(matches)} matches, {len(hits)} arbs / {len(arbs)} compared")
+    for row in matches[:8]:
+        print(
+            f"  [{row['sport']}] {row['game_date']} {row['team_a']} vs {row['team_b']}: "
+            f"Kalshi {row['kalshi_yes_a']}/{row['kalshi_yes_b']}  "
+            f"Poly {row['poly_yes_a']}/{row['poly_yes_b']}"
+        )
+    if len(matches) > 8:
+        print(f"  ... {len(matches) - 8} more")
+    if hits:
+        print("Arbs (pre-fee):")
+        for row in hits[:12]:
+            print(f"  [{row['sport']}] {row['game_date']} {row['best_trade']}  cost={row['best_cost']} edge={row['best_edge']}")
+        if len(hits) > 12:
+            print(f"  ... {len(hits) - 12} more")
+    else:
+        print("No pre-fee arbs this run (best edges are in the arbs table).")
+
+
+def discover() -> tuple[list[dict], list[dict], list[dict]]:
     all_markets: list[dict] = []
     all_matches: list[dict] = []
     all_arbs: list[dict] = []
-
     for sport, module, label, level in SPORTS:
         print(f"Fetching Kalshi {label} moneylines...")
         kalshi = module.fetch_kalshi()
@@ -261,26 +373,13 @@ def main() -> None:
         all_markets.extend(kalshi + poly)
         all_matches.extend(matches)
         all_arbs.extend(arbs)
-
     save_db(all_markets, all_matches, all_arbs)
-    hits = [row for row in all_arbs if row["is_arb"]]
-    print(f"Wrote {DB_PATH.name}: {len(all_markets)} markets, {len(all_matches)} matches, {len(hits)} arbs / {len(all_arbs)} compared")
-    for row in all_matches[:8]:
-        print(
-            f"  [{row['sport']}] {row['game_date']} {row['team_a']} vs {row['team_b']}: "
-            f"Kalshi {row['kalshi_yes_a']}/{row['kalshi_yes_b']}  "
-            f"Poly {row['poly_yes_a']}/{row['poly_yes_b']}"
-        )
-    if len(all_matches) > 8:
-        print(f"  ... {len(all_matches) - 8} more")
-    if hits:
-        print("Arbs (pre-fee):")
-        for row in hits[:12]:
-            print(f"  [{row['sport']}] {row['game_date']} {row['best_trade']}  cost={row['best_cost']} edge={row['best_edge']}")
-        if len(hits) > 12:
-            print(f"  ... {len(hits) - 12} more")
-    else:
-        print("No pre-fee arbs this run (best edges are in the arbs table).")
+    print_summary(all_markets, all_matches, all_arbs)
+    return all_markets, all_matches, all_arbs
+
+
+def main() -> None:
+    discover()
 
 
 if __name__ == "__main__":
