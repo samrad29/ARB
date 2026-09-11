@@ -1,10 +1,12 @@
 """Poll matched moneylines for live prices; rediscover markets about every 10 minutes.
 
 Run:  python -m polling
+      python -m polling --minutes 60
 """
 
 from __future__ import annotations
 
+import argparse
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -150,21 +152,61 @@ def poll_once(conn: sqlite3.Connection) -> None:
     )
 
 
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Poll live prices; rediscover about every 10 minutes.")
+    parser.add_argument(
+        "minutes",
+        nargs="?",
+        type=float,
+        default=None,
+        help="Stop after this many minutes. Default: run until Ctrl+C.",
+    )
+    parser.add_argument(
+        "-m",
+        "--minutes",
+        dest="minutes_flag",
+        type=float,
+        default=None,
+        metavar="MINUTES",
+        help="Same as the positional minutes argument.",
+    )
+    args = parser.parse_args(argv)
+    minutes = args.minutes_flag if args.minutes_flag is not None else args.minutes
+    if minutes is not None and minutes <= 0:
+        parser.error("minutes must be positive")
+    args.minutes = minutes
+    return args
+
+
 def main() -> None:
+    args = parse_args()
+    deadline = None if args.minutes is None else time.monotonic() + args.minutes * 60
     conn = connect()
     try:
+        if args.minutes is not None:
+            print(f"Running for {args.minutes:g} minutes...")
         print("Initial discovery...")
         discover()
         last_discovery = time.monotonic()
         while True:
+            if deadline is not None and time.monotonic() >= deadline:
+                print("Time limit reached.")
+                break
             started = time.monotonic()
             poll_once(conn)
+            if deadline is not None and time.monotonic() >= deadline:
+                print("Time limit reached.")
+                break
             if time.monotonic() - last_discovery >= DISCOVERY_SECONDS:
                 print("Rediscovering markets...")
                 discover()
                 last_discovery = time.monotonic()
-            elapsed = time.monotonic() - started
-            wait = TARGET_CYCLE_SECONDS - elapsed
+                if deadline is not None and time.monotonic() >= deadline:
+                    print("Time limit reached.")
+                    break
+            wait = TARGET_CYCLE_SECONDS - (time.monotonic() - started)
+            if deadline is not None:
+                wait = min(wait, deadline - time.monotonic())
             if wait > 0:
                 time.sleep(wait)
     except KeyboardInterrupt:

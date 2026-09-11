@@ -2,7 +2,8 @@ Pull NFL, college football, and tennis moneyline markets from Kalshi and Polymar
 
 ```
 python main.py               # one discovery pass
-python -m polling            # poll live prices; rediscover about every 10 minutes
+python -m polling            # poll until Ctrl+C; rediscover about every 10 minutes
+python -m polling --minutes 60
 python -m polling.analysis   # arb counts, size buckets, and durations from price_ticks
 ```
 
