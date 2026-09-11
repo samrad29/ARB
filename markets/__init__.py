@@ -1,1 +1,1 @@
-"""Sport-specific market discovery (NFL and college football)."""
+"""Sport-specific market discovery (NFL, college football, tennis)."""

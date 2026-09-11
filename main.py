@@ -1,4 +1,4 @@
-"""Pull NFL and CFB moneyline markets, match them, find arbs, store in SQLite.
+"""Pull NFL, CFB, and tennis moneyline markets, match them, find arbs, store in SQLite.
 
 Run:  python main.py
 Poll: python -m polling
@@ -7,21 +7,29 @@ Poll: python -m polling
 from __future__ import annotations
 
 import sqlite3
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
 from util import game_status, parse_game_date
-from markets import cfp_moneyline, nfl
+from markets import cfp_moneyline, nfl, tennis
 
 DB_PATH = Path(__file__).resolve().parent / "moneyline.db"
 DATE_WINDOW_DAYS = 1
 SPORTS = (
     ("nfl", nfl, "NFL", "pro"),
     ("cfb", cfp_moneyline, "CFB", "college"),
+    ("tennis", tennis, "Tennis", "tour"),
 )
 
 
-def match_markets(kalshi: list[dict], poly: list[dict], sport: str, level: str) -> list[dict]:
+def match_markets(
+    kalshi: list[dict],
+    poly: list[dict],
+    sport: str,
+    level: str,
+    names_equal=None,
+) -> list[dict]:
     def by_game(rows: list[dict]) -> dict[tuple, dict]:
         games: dict[tuple, dict] = {}
         for row in rows:
@@ -36,6 +44,21 @@ def match_markets(kalshi: list[dict], poly: list[dict], sport: str, level: str) 
             game["prices"][row["team"]] = row
         return games
 
+    def map_teams(k_teams: frozenset, p_teams: frozenset) -> dict | None:
+        if k_teams == p_teams:
+            return {name: name for name in k_teams}
+        if names_equal is None or len(k_teams) != 2 or len(p_teams) != 2:
+            return None
+        mapping: dict[str, str] = {}
+        used: set[str] = set()
+        for k_name in k_teams:
+            hits = [p_name for p_name in p_teams if p_name not in used and names_equal(k_name, p_name)]
+            if len(hits) != 1:
+                return None
+            mapping[k_name] = hits[0]
+            used.add(hits[0])
+        return mapping
+
     kalshi_games = by_game(kalshi)
     poly_games = by_game(poly)
     used_poly: set[tuple] = set()
@@ -43,32 +66,33 @@ def match_markets(kalshi: list[dict], poly: list[dict], sport: str, level: str) 
     for (teams, k_date), k_game in kalshi_games.items():
         candidates = []
         for (p_teams, p_date), p_game in poly_games.items():
-            if p_teams != teams:
+            mapped = map_teams(teams, p_teams)
+            if not mapped:
                 continue
             delta = abs((p_date - k_date).days)
             if delta <= DATE_WINDOW_DAYS:
-                candidates.append((delta, p_date, p_game))
+                candidates.append((delta, p_date, p_game, p_teams, mapped))
         candidates.sort(key=lambda item: (item[0], item[1]))
         picked = None
-        for _delta, p_date, p_game in candidates:
-            poly_key = (teams, p_date)
+        for _delta, p_date, p_game, p_teams, mapped in candidates:
+            poly_key = (p_teams, p_date)
             if poly_key in used_poly:
                 continue
             used_poly.add(poly_key)
-            picked = (p_date, p_game)
+            picked = (p_date, p_game, mapped)
             break
         if picked is None:
             continue
-        p_date, p_game = picked
+        p_date, p_game, mapped = picked
         names = sorted(teams)
         k_a = k_game["prices"].get(names[0], {})
         k_b = k_game["prices"].get(names[1], {})
-        p_a = p_game["prices"].get(names[0], {})
-        p_b = p_game["prices"].get(names[1], {})
+        p_a = p_game["prices"].get(mapped[names[0]], {})
+        p_b = p_game["prices"].get(mapped[names[1]], {})
         matches.append(
             {
-                "sport": sport,
-                "level": level,
+                "sport": k_game["meta"].get("sport") or sport,
+                "level": k_game["meta"].get("level") or level,
                 "game_date": k_date.isoformat(),
                 "poly_game_date": p_date.isoformat(),
                 "team_a": names[0],
@@ -371,8 +395,9 @@ def print_summary(markets: list[dict], matches: list[dict], arbs: list[dict]) ->
     )
     for row in matches[:8]:
         tag = f" {game_status(row)}" if game_status(row) in {"live", "ended"} else ""
+        label = row["sport"] if row["sport"] != "tennis" else f"tennis/{row['level']}"
         print(
-            f"  [{row['sport']}]{tag} {row['game_date']} {row['team_a']} vs {row['team_b']}: "
+            f"  [{label}]{tag} {row['game_date']} {row['team_a']} vs {row['team_b']}: "
             f"Kalshi {row['kalshi_yes_a']}/{row['kalshi_yes_b']}  "
             f"Poly {row['poly_yes_a']}/{row['poly_yes_b']}"
         )
@@ -382,8 +407,9 @@ def print_summary(markets: list[dict], matches: list[dict], arbs: list[dict]) ->
         print("Arbs (pre-fee):")
         for row in hits[:12]:
             tag = " LIVE" if game_status(row) == "live" else ""
+            label = row["sport"] if row["sport"] != "tennis" else f"tennis/{row['level']}"
             print(
-                f"  [{row['sport']}]{tag} {row['game_date']} {row['best_trade']}  "
+                f"  [{label}]{tag} {row['game_date']} {row['best_trade']}  "
                 f"cost={row['best_cost']} edge={row['best_edge']}"
             )
         if len(hits) > 12:
@@ -399,11 +425,17 @@ def discover() -> tuple[list[dict], list[dict], list[dict]]:
     for sport, module, label, level in SPORTS:
         print(f"Fetching Kalshi {label} moneylines...")
         kalshi = module.fetch_kalshi()
-        print(f"  {len(kalshi)} team-win contracts")
+        print(f"  {len(kalshi)} contracts{_level_counts(kalshi)}")
         print(f"Fetching Polymarket {label} moneylines...")
         poly = module.fetch_polymarket()
-        print(f"  {len(poly)} team-win outcomes")
-        matches = match_markets(kalshi, poly, sport, level)
+        print(f"  {len(poly)} outcomes{_level_counts(poly)}")
+        matches = match_markets(
+            kalshi,
+            poly,
+            sport,
+            level,
+            names_equal=getattr(module, "names_equal", None),
+        )
         arbs = find_arbs(matches)
         all_markets.extend(kalshi + poly)
         all_matches.extend(matches)
@@ -411,6 +443,14 @@ def discover() -> tuple[list[dict], list[dict], list[dict]]:
     save_db(all_markets, all_matches, all_arbs)
     print_summary(all_markets, all_matches, all_arbs)
     return all_markets, all_matches, all_arbs
+
+
+def _level_counts(rows: list[dict]) -> str:
+    levels = Counter(row.get("level") for row in rows if row.get("level"))
+    if len(levels) <= 1:
+        return ""
+    detail = ", ".join(f"{name} {n}" for name, n in sorted(levels.items()))
+    return f" ({detail})"
 
 
 def main() -> None:

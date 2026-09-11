@@ -137,8 +137,9 @@ def poll_once(conn: sqlite3.Connection) -> None:
             else:
                 pre_hits += 1
             tag = " LIVE" if game_status(row) == "live" else ""
+            label = row["sport"] if row.get("sport") != "tennis" else f"tennis/{row.get('level')}"
             print(
-                f"  ARB [{row['sport']}]{tag} {row['team_a']} vs {row['team_b']}  "
+                f"  ARB [{label}]{tag} {row['team_a']} vs {row['team_b']}  "
                 f"{row.get('best_trade')}  cost={row.get('best_cost')} edge={row.get('best_edge')}"
             )
         save_tick(conn, row, observed_at)

@@ -296,6 +296,8 @@ def format_ts(value: datetime | None) -> str:
 
 def _game(row: dict) -> str:
     sport = row.get("sport") or "?"
+    if sport == "tennis" and row.get("level"):
+        sport = f"tennis/{row['level']}"
     date = row.get("game_date") or "?"
     return f"[{sport}] {date} {row.get('team_a')} vs {row.get('team_b')}"
 

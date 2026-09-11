@@ -5,10 +5,15 @@ from __future__ import annotations
 from util import KALSHI, POLY, get_json, maybe_json, parse_price
 from markets.nfl.fetch import team_id as nfl_team_id
 from markets.cfp_moneyline.fetch import team_id as cfb_team_id
+from markets.tennis import player_id as tennis_player_id
 
 
 def team_id(sport: str, text: str | None) -> str | None:
-    return nfl_team_id(text) if sport == "nfl" else cfb_team_id(text)
+    if sport == "nfl":
+        return nfl_team_id(text)
+    if sport == "tennis":
+        return tennis_player_id(text)
+    return cfb_team_id(text)
 
 
 def kalshi_prices(event_id: str | None, ticker_a: str | None, ticker_b: str | None) -> dict:
