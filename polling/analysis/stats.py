@@ -1,0 +1,366 @@
+"""Summarize arb episodes from `price_ticks`.
+
+An episode is a contiguous run for one matched game where edge stays at or
+above a threshold. Short poll/discovery gaps stay in the same episode; a
+gap of 15+ minutes starts a new one.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+from statistics import median
+
+from main import DB_PATH, connect
+from util import parse_dt
+
+CENT = 0.01
+CENT_THRESHOLDS = (1, 2, 3)
+LARGEST_N = 12
+SESSION_GAP_SECONDS = 15 * 60
+
+
+def load_ticks(conn: sqlite3.Connection) -> list[dict]:
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        """
+        SELECT observed_at, sport, level, game_date, team_a, team_b,
+               best_cost, best_edge, is_arb, best_trade, closed
+        FROM price_ticks
+        ORDER BY observed_at, sport, team_a, team_b
+        """
+    ).fetchall()
+    ticks = []
+    for row in rows:
+        item = dict(row)
+        ts = parse_dt(item["observed_at"])
+        if ts is None:
+            continue
+        item["_ts"] = ts
+        ticks.append(item)
+    return ticks
+
+
+def poll_gaps(ticks: list[dict]) -> list[float]:
+    times = sorted({tick["_ts"] for tick in ticks})
+    return [(times[i] - times[i - 1]).total_seconds() for i in range(1, len(times))]
+
+
+def typical_poll_seconds(ticks: list[dict]) -> float:
+    gaps = [gap for gap in poll_gaps(ticks) if gap < 60]
+    if not gaps:
+        return 8.0
+    return float(median(gaps))
+
+
+def gap_break_seconds(ticks: list[dict] | None = None) -> float:
+    return float(SESSION_GAP_SECONDS)
+
+
+def _active(tick: dict, min_edge: float, inclusive: bool) -> bool:
+    if tick.get("closed"):
+        return False
+    edge = tick.get("best_edge")
+    if edge is None:
+        return False
+    return edge >= min_edge if inclusive else edge > min_edge
+
+
+def _match_key(tick: dict) -> tuple:
+    return (tick.get("sport"), tick.get("game_date"), tick.get("team_a"), tick.get("team_b"))
+
+
+def find_episodes(
+    ticks: list[dict],
+    min_edge: float,
+    *,
+    inclusive: bool = True,
+    gap_break: float | None = None,
+) -> list[dict]:
+    """Contiguous runs where `best_edge` meets `min_edge`."""
+    if not ticks:
+        return []
+    break_after = gap_break_seconds(ticks) if gap_break is None else gap_break
+    global_end = max(tick["_ts"] for tick in ticks)
+    grouped: dict[tuple, list[dict]] = {}
+    for tick in ticks:
+        grouped.setdefault(_match_key(tick), []).append(tick)
+
+    episodes: list[dict] = []
+    for _key, rows in grouped.items():
+        rows = sorted(rows, key=lambda item: item["_ts"])
+        current: dict | None = None
+        prev: dict | None = None
+        for row in rows:
+            on = _active(row, min_edge, inclusive)
+            gap = (row["_ts"] - prev["_ts"]).total_seconds() if prev else 0.0
+            if current and (not on or gap > break_after):
+                if not on and gap <= break_after:
+                    end = row["_ts"]
+                else:
+                    end = current["last_ts"]
+                episodes.append(_close_episode(current, end, still_open=False))
+                current = None
+            if on:
+                edge = float(row["best_edge"])
+                if current is None:
+                    current = {
+                        "sport": row.get("sport"),
+                        "level": row.get("level"),
+                        "game_date": row.get("game_date"),
+                        "team_a": row.get("team_a"),
+                        "team_b": row.get("team_b"),
+                        "best_trade": row.get("best_trade"),
+                        "start": row["_ts"],
+                        "last_ts": row["_ts"],
+                        "peak_edge": edge,
+                        "ticks": 1,
+                        "min_edge": min_edge,
+                        "inclusive": inclusive,
+                    }
+                else:
+                    current["last_ts"] = row["_ts"]
+                    current["ticks"] += 1
+                    if edge > current["peak_edge"]:
+                        current["peak_edge"] = edge
+                        current["best_trade"] = row.get("best_trade")
+            prev = row
+        if current:
+            last_ts = current["last_ts"]
+            still_open = (global_end - last_ts).total_seconds() <= break_after
+            episodes.append(_close_episode(current, last_ts, still_open=still_open))
+    episodes.sort(key=lambda item: (-item["peak_edge"], -item["duration_seconds"], item["start"]))
+    return episodes
+
+
+def _close_episode(current: dict, end: datetime, still_open: bool) -> dict:
+    start = current["start"]
+    duration = max(0.0, (end - start).total_seconds())
+    return {
+        "sport": current["sport"],
+        "level": current["level"],
+        "game_date": current["game_date"],
+        "team_a": current["team_a"],
+        "team_b": current["team_b"],
+        "best_trade": current["best_trade"],
+        "start": start,
+        "end": end,
+        "last_ts": current["last_ts"],
+        "duration_seconds": duration,
+        "peak_edge": current["peak_edge"],
+        "ticks": current["ticks"],
+        "still_open": still_open,
+        "min_edge": current["min_edge"],
+        "inclusive": current["inclusive"],
+    }
+
+
+def unique_matches(rows: list[dict]) -> set[tuple]:
+    return {(row["sport"], row["game_date"], row["team_a"], row["team_b"]) for row in rows}
+
+
+def match_rollups(episodes: list[dict]) -> list[dict]:
+    """One row per game: peak edge and summed episode time."""
+    by_match: dict[tuple, dict] = {}
+    for episode in episodes:
+        key = _match_key(episode)
+        row = by_match.get(key)
+        if row is None:
+            by_match[key] = {
+                "sport": episode["sport"],
+                "level": episode["level"],
+                "game_date": episode["game_date"],
+                "team_a": episode["team_a"],
+                "team_b": episode["team_b"],
+                "best_trade": episode.get("best_trade"),
+                "peak_edge": episode["peak_edge"],
+                "duration_seconds": episode["duration_seconds"],
+                "ticks": episode["ticks"],
+                "episodes": 1,
+                "still_open": episode["still_open"],
+                "start": episode["start"],
+                "end": episode["end"],
+            }
+            continue
+        row["duration_seconds"] += episode["duration_seconds"]
+        row["ticks"] += episode["ticks"]
+        row["episodes"] += 1
+        row["still_open"] = row["still_open"] or episode["still_open"]
+        if episode["start"] < row["start"]:
+            row["start"] = episode["start"]
+        if episode["end"] > row["end"]:
+            row["end"] = episode["end"]
+        if episode["peak_edge"] > row["peak_edge"]:
+            row["peak_edge"] = episode["peak_edge"]
+            row["best_trade"] = episode.get("best_trade")
+    rolled = list(by_match.values())
+    rolled.sort(key=lambda item: (-item["peak_edge"], -item["duration_seconds"], item["start"]))
+    return rolled
+
+
+def duration_stats(episodes: list[dict]) -> dict:
+    durations = [row["duration_seconds"] for row in episodes]
+    open_n = sum(1 for row in episodes if row["still_open"])
+    if not durations:
+        return {
+            "n": 0,
+            "open_n": 0,
+            "mean": None,
+            "median": None,
+            "min": None,
+            "max": None,
+        }
+    return {
+        "n": len(durations),
+        "open_n": open_n,
+        "mean": sum(durations) / len(durations),
+        "median": float(median(durations)),
+        "min": min(durations),
+        "max": max(durations),
+    }
+
+
+def format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "n/a"
+    total = int(round(max(0.0, seconds)))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def format_cents(edge: float | None) -> str:
+    if edge is None:
+        return "n/a"
+    return f"{edge * 100:.2f}c"
+
+
+def format_ts(value: datetime | None) -> str:
+    if value is None:
+        return "n/a"
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _game(row: dict) -> str:
+    sport = row.get("sport") or "?"
+    date = row.get("game_date") or "?"
+    return f"[{sport}] {date} {row.get('team_a')} vs {row.get('team_b')}"
+
+
+def _plural(n: int, singular: str, plural: str | None = None) -> str:
+    if n == 1:
+        return singular
+    return plural or singular + "s"
+
+
+def analyze(db_path: Path | None = None) -> dict:
+    path = Path(db_path) if db_path else DB_PATH
+    conn = sqlite3.connect(path) if db_path else connect()
+    try:
+        ticks = load_ticks(conn)
+    finally:
+        conn.close()
+
+    arb_episodes = find_episodes(ticks, 0.0, inclusive=False)
+    by_cents = {
+        cents: find_episodes(ticks, cents * CENT, inclusive=True)
+        for cents in CENT_THRESHOLDS
+    }
+    gaps = poll_gaps(ticks)
+    times = [tick["_ts"] for tick in ticks]
+    quoted = unique_matches(ticks)
+    return {
+        "db_path": str(path),
+        "ticks": len(ticks),
+        "quoted_matches": len(quoted),
+        "window_start": min(times) if times else None,
+        "window_end": max(times) if times else None,
+        "poll_cycles": len({tick["observed_at"] for tick in ticks}),
+        "typical_poll_seconds": typical_poll_seconds(ticks) if ticks else None,
+        "gap_break_seconds": gap_break_seconds(ticks) if ticks else None,
+        "max_poll_gap": max(gaps) if gaps else None,
+        "arb_matches": len(unique_matches(arb_episodes)),
+        "arb_episodes": arb_episodes,
+        "arb_duration": duration_stats(arb_episodes),
+        "by_cents": {
+            cents: {
+                "matches": len(unique_matches(episodes)),
+                "episodes": episodes,
+                "duration": duration_stats(episodes),
+            }
+            for cents, episodes in by_cents.items()
+        },
+        "largest": match_rollups(arb_episodes)[:LARGEST_N],
+    }
+
+
+def print_report(report: dict) -> None:
+    print(f"Polling analysis  ({report['db_path']})")
+    if not report["ticks"]:
+        print("No price_ticks yet. Run `python -m polling` first.")
+        return
+    window = (report["window_end"] - report["window_start"]).total_seconds() if report["window_start"] else 0
+    print(
+        f"Window: {format_ts(report['window_start'])} -> {format_ts(report['window_end'])}  "
+        f"({format_duration(window)}, {report['poll_cycles']} cycles, "
+        f"~{report['typical_poll_seconds']:.1f}s poll)"
+    )
+    print(f"Quoted matches: {report['quoted_matches']}   ticks: {report['ticks']}")
+    print()
+    print(
+        f"Total arbs: {report['arb_matches']} {_plural(report['arb_matches'], 'match', 'matches')}, "
+        f"{len(report['arb_episodes'])} {_plural(len(report['arb_episodes']), 'episode')}  (edge > 0)"
+    )
+    print("How many were >1 / >2 / >3 cents (peak edge, inclusive):")
+    for cents, bucket in report["by_cents"].items():
+        n_ep = len(bucket["episodes"])
+        print(
+            f"  >= {cents} cent   {bucket['matches']} {_plural(bucket['matches'], 'match', 'matches')}, "
+            f"{n_ep} {_plural(n_ep, 'episode')}"
+        )
+    print()
+    print("Largest arbs:")
+    if not report["largest"]:
+        print("  none")
+    for row in report["largest"]:
+        open_tag = "  still open" if row["still_open"] else ""
+        trade = f"  {row['best_trade']}" if row.get("best_trade") else ""
+        extra = f", {row['episodes']} episodes" if row.get("episodes", 1) > 1 else ""
+        print(
+            f"  {format_cents(row['peak_edge']):>7}  {_game(row)}  "
+            f"{format_duration(row['duration_seconds'])}  {row['ticks']} ticks{extra}{open_tag}{trade}"
+        )
+    print()
+    _print_duration("Average arb duration (all edge > 0 episodes)", report["arb_duration"])
+    for cents in (2, 3):
+        _print_duration(f">= {cents} cent arb duration", report["by_cents"][cents]["duration"], trailing_blank=False)
+        for row in report["by_cents"][cents]["episodes"]:
+            open_tag = "  still open" if row["still_open"] else ""
+            print(
+                f"    {format_cents(row['peak_edge']):>7}  {_game(row)}  "
+                f"{format_duration(row['duration_seconds'])}  "
+                f"{format_ts(row['start'])} -> {format_ts(row['end'])}{open_tag}"
+            )
+        print()
+
+
+def _print_duration(title: str, stats: dict, trailing_blank: bool = True) -> None:
+    print(title + ":")
+    if not stats["n"]:
+        print("  none")
+    else:
+        open_note = f", {stats['open_n']} still open (duration is a lower bound)" if stats["open_n"] else ""
+        print(
+            f"  n={stats['n']}{open_note}  mean={format_duration(stats['mean'])}  "
+            f"median={format_duration(stats['median'])}  "
+            f"min={format_duration(stats['min'])}  max={format_duration(stats['max'])}"
+        )
+    if trailing_blank:
+        print()

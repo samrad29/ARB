@@ -7,13 +7,15 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 from main import connect, discover, find_arbs
 from polling.prices import kalshi_prices, poly_prices
 
-PRICE_POLL_SECONDS = 30
+TARGET_CYCLE_SECONDS = 8
 DISCOVERY_SECONDS = 600
+QUOTE_WORKERS = 16
 
 
 def utc_now() -> str:
@@ -103,14 +105,19 @@ def save_tick(conn: sqlite3.Connection, row: dict, observed_at: str) -> None:
 def poll_once(conn: sqlite3.Connection) -> None:
     matches = load_matches(conn)
     observed_at = utc_now()
+    started = time.monotonic()
     hits = 0
     closed = 0
     quoted = 0
     print(f"Polling {len(matches)} matches at {observed_at}...")
-    for match in matches:
-        row = quote_match(match)
-        if row is None:
-            continue
+    rows: list[dict] = []
+    with ThreadPoolExecutor(max_workers=QUOTE_WORKERS) as pool:
+        futures = [pool.submit(quote_match, match) for match in matches]
+        for future in as_completed(futures):
+            row = future.result()
+            if row is not None:
+                rows.append(row)
+    for row in rows:
         quoted += 1
         if row.get("closed"):
             closed += 1
@@ -122,7 +129,7 @@ def poll_once(conn: sqlite3.Connection) -> None:
             )
         save_tick(conn, row, observed_at)
     conn.commit()
-    print(f"  quoted {quoted}, closed {closed}, arbs {hits}")
+    print(f"  quoted {quoted}, closed {closed}, arbs {hits} in {time.monotonic() - started:.1f}s")
 
 
 def main() -> None:
@@ -132,12 +139,16 @@ def main() -> None:
         discover()
         last_discovery = time.monotonic()
         while True:
+            started = time.monotonic()
             poll_once(conn)
             if time.monotonic() - last_discovery >= DISCOVERY_SECONDS:
                 print("Rediscovering markets...")
                 discover()
                 last_discovery = time.monotonic()
-            time.sleep(PRICE_POLL_SECONDS)
+            elapsed = time.monotonic() - started
+            wait = TARGET_CYCLE_SECONDS - elapsed
+            if wait > 0:
+                time.sleep(wait)
     except KeyboardInterrupt:
         print("\nStopped.")
     finally:

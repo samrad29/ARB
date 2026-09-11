@@ -1,11 +1,12 @@
 Pull NFL and college football moneyline markets from Kalshi and Polymarket, match the same games, and store a SQLite snapshot.
 
 ```
-python main.py          # one discovery pass
-python -m polling       # poll live prices; rediscover about every 10 minutes
+python main.py               # one discovery pass
+python -m polling            # poll live prices; rediscover about every 10 minutes
+python -m polling.analysis   # arb counts, size buckets, and durations from price_ticks
 ```
 
-`markets/nfl/` and `markets/cfp_moneyline/` hold sport-specific team names and API pulls. `polling/` quotes the current matches.
+`python -m polling` quotes matches in parallel and starts the next pass immediately if quoting already took 8+ seconds (otherwise it waits out the rest of an 8-second cycle). Discovery still reruns about every 10 minutes.
 
 `moneyline.db` tables:
 
