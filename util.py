@@ -66,3 +66,26 @@ def maybe_json(value):
         except json.JSONDecodeError:
             return value
     return value
+
+
+def _flag(value) -> int:
+    return 1 if value in (1, True, "true", "True") else 0
+
+
+def poly_game_state(event: dict | None) -> dict:
+    """Polymarket sports events expose `live` / `ended` (pregame is both unset)."""
+    event = event or {}
+    return {"live": _flag(event.get("live")), "ended": _flag(event.get("ended"))}
+
+
+def game_status(row: dict | None) -> str:
+    """live, pregame, ended, or unknown from stored Polymarket flags."""
+    if not row:
+        return "unknown"
+    if _flag(row.get("live")):
+        return "live"
+    if _flag(row.get("ended")):
+        return "ended"
+    if row.get("live") is None and row.get("ended") is None:
+        return "unknown"
+    return "pregame"

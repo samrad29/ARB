@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 
 from main import connect, discover, find_arbs
 from polling.prices import kalshi_prices, poly_prices
+from util import game_status
 
 TARGET_CYCLE_SECONDS = 8
 DISCOVERY_SECONDS = 600
@@ -28,7 +29,8 @@ def load_matches(conn: sqlite3.Connection) -> list[dict]:
         """
         SELECT sport, level, game_date, poly_game_date, team_a, team_b,
                kalshi_event, polymarket_event, kalshi_url, polymarket_url,
-               kalshi_event_id, kalshi_id_a, kalshi_id_b, poly_id, poly_event_id
+               kalshi_event_id, kalshi_id_a, kalshi_id_b, poly_id, poly_event_id,
+               live, ended
         FROM matches
         """
     ).fetchall()
@@ -53,6 +55,8 @@ def quote_match(match: dict) -> dict | None:
         return quoted
     row = scored[0]
     row["closed"] = quoted["closed"]
+    row["live"] = quoted.get("live") or 0
+    row["ended"] = quoted.get("ended") or 0
     return row
 
 
@@ -62,8 +66,8 @@ def save_tick(conn: sqlite3.Connection, row: dict, observed_at: str) -> None:
         INSERT INTO price_ticks (
             observed_at, sport, level, game_date, team_a, team_b,
             kalshi_yes_a, poly_yes_a, kalshi_yes_b, poly_yes_b,
-            best_cost, best_edge, is_arb, best_trade, closed
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            best_cost, best_edge, is_arb, best_trade, closed, live, ended
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             observed_at,
@@ -81,6 +85,8 @@ def save_tick(conn: sqlite3.Connection, row: dict, observed_at: str) -> None:
             row.get("is_arb") or 0,
             row.get("best_trade"),
             row.get("closed") or 0,
+            row.get("live") or 0,
+            row.get("ended") or 0,
         ),
     )
     if row.get("is_arb") and not row.get("closed"):
@@ -90,15 +96,16 @@ def save_tick(conn: sqlite3.Connection, row: dict, observed_at: str) -> None:
                 observed_at, source, sport, level, game_date, poly_game_date, team_a, team_b,
                 kalshi_event, polymarket_event, kalshi_yes_a, poly_yes_a, team_a_price_diff,
                 kalshi_yes_b, poly_yes_b, team_b_price_diff, kalshi_a_plus_poly_b, poly_a_plus_kalshi_b,
-                best_cost, best_edge, is_arb, best_trade, kalshi_url, polymarket_url
+                best_cost, best_edge, is_arb, best_trade, kalshi_url, polymarket_url, live, ended
             ) VALUES (
                 :observed_at, :source, :sport, :level, :game_date, :poly_game_date, :team_a, :team_b,
                 :kalshi_event, :polymarket_event, :kalshi_yes_a, :poly_yes_a, :team_a_price_diff,
                 :kalshi_yes_b, :poly_yes_b, :team_b_price_diff, :kalshi_a_plus_poly_b, :poly_a_plus_kalshi_b,
-                :best_cost, :best_edge, :is_arb, :best_trade, :kalshi_url, :polymarket_url
+                :best_cost, :best_edge, :is_arb, :best_trade, :kalshi_url, :polymarket_url, :live, :ended
             )
             """,
-            {**row, "observed_at": observed_at, "source": "poll", "is_arb": 1},
+            {**row, "observed_at": observed_at, "source": "poll", "is_arb": 1,
+             "live": row.get("live") or 0, "ended": row.get("ended") or 0},
         )
 
 
@@ -107,6 +114,8 @@ def poll_once(conn: sqlite3.Connection) -> None:
     observed_at = utc_now()
     started = time.monotonic()
     hits = 0
+    live_hits = 0
+    pre_hits = 0
     closed = 0
     quoted = 0
     print(f"Polling {len(matches)} matches at {observed_at}...")
@@ -123,13 +132,21 @@ def poll_once(conn: sqlite3.Connection) -> None:
             closed += 1
         if row.get("is_arb") and not row.get("closed"):
             hits += 1
+            if game_status(row) == "live":
+                live_hits += 1
+            else:
+                pre_hits += 1
+            tag = " LIVE" if game_status(row) == "live" else ""
             print(
-                f"  ARB [{row['sport']}] {row['team_a']} vs {row['team_b']}  "
+                f"  ARB [{row['sport']}]{tag} {row['team_a']} vs {row['team_b']}  "
                 f"{row.get('best_trade')}  cost={row.get('best_cost')} edge={row.get('best_edge')}"
             )
         save_tick(conn, row, observed_at)
     conn.commit()
-    print(f"  quoted {quoted}, closed {closed}, arbs {hits} in {time.monotonic() - started:.1f}s")
+    print(
+        f"  quoted {quoted}, closed {closed}, arbs {hits} "
+        f"({live_hits} live / {pre_hits} pregame) in {time.monotonic() - started:.1f}s"
+    )
 
 
 def main() -> None:

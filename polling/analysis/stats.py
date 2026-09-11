@@ -13,20 +13,27 @@ from pathlib import Path
 from statistics import median
 
 from main import DB_PATH, connect
-from util import parse_dt
+from util import game_status, parse_dt
 
 CENT = 0.01
 CENT_THRESHOLDS = (1, 2, 3)
 LARGEST_N = 12
 SESSION_GAP_SECONDS = 15 * 60
+STATUS_ORDER = ("live", "pregame", "ended", "unknown")
 
 
 def load_ticks(conn: sqlite3.Connection) -> list[dict]:
     conn.row_factory = sqlite3.Row
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(price_ticks)")}
+    extra = ""
+    if "live" in cols:
+        extra += ", live"
+    if "ended" in cols:
+        extra += ", ended"
     rows = conn.execute(
-        """
+        f"""
         SELECT observed_at, sport, level, game_date, team_a, team_b,
-               best_cost, best_edge, is_arb, best_trade, closed
+               best_cost, best_edge, is_arb, best_trade, closed{extra}
         FROM price_ticks
         ORDER BY observed_at, sport, team_a, team_b
         """
@@ -38,6 +45,8 @@ def load_ticks(conn: sqlite3.Connection) -> list[dict]:
         if ts is None:
             continue
         item["_ts"] = ts
+        item.setdefault("live", None)
+        item.setdefault("ended", None)
         ticks.append(item)
     return ticks
 
@@ -94,9 +103,10 @@ def find_episodes(
         prev: dict | None = None
         for row in rows:
             on = _active(row, min_edge, inclusive)
+            row_status = game_status(row)
             gap = (row["_ts"] - prev["_ts"]).total_seconds() if prev else 0.0
-            if current and (not on or gap > break_after):
-                if not on and gap <= break_after:
+            if current and (not on or gap > break_after or row_status != current["status"]):
+                if not on and gap <= break_after and row_status == current["status"]:
                     end = row["_ts"]
                 else:
                     end = current["last_ts"]
@@ -118,6 +128,9 @@ def find_episodes(
                         "ticks": 1,
                         "min_edge": min_edge,
                         "inclusive": inclusive,
+                        "live": row.get("live"),
+                        "ended": row.get("ended"),
+                        "status": row_status,
                     }
                 else:
                     current["last_ts"] = row["_ts"]
@@ -153,6 +166,9 @@ def _close_episode(current: dict, end: datetime, still_open: bool) -> dict:
         "still_open": still_open,
         "min_edge": current["min_edge"],
         "inclusive": current["inclusive"],
+        "live": current.get("live"),
+        "ended": current.get("ended"),
+        "status": current.get("status") or game_status(current),
     }
 
 
@@ -181,6 +197,9 @@ def match_rollups(episodes: list[dict]) -> list[dict]:
                 "still_open": episode["still_open"],
                 "start": episode["start"],
                 "end": episode["end"],
+                "live": episode.get("live"),
+                "ended": episode.get("ended"),
+                "status": episode.get("status") or game_status(episode),
             }
             continue
         row["duration_seconds"] += episode["duration_seconds"]
@@ -194,6 +213,12 @@ def match_rollups(episodes: list[dict]) -> list[dict]:
         if episode["peak_edge"] > row["peak_edge"]:
             row["peak_edge"] = episode["peak_edge"]
             row["best_trade"] = episode.get("best_trade")
+            row["live"] = episode.get("live")
+            row["ended"] = episode.get("ended")
+            row["status"] = episode.get("status") or game_status(episode)
+        if (episode.get("status") or game_status(episode)) == "live":
+            row["live"] = 1
+            row["status"] = "live"
     rolled = list(by_match.values())
     rolled.sort(key=lambda item: (-item["peak_edge"], -item["duration_seconds"], item["start"]))
     return rolled
@@ -219,6 +244,27 @@ def duration_stats(episodes: list[dict]) -> dict:
         "min": min(durations),
         "max": max(durations),
     }
+
+
+def status_breakdown(ticks: list[dict], arb_episodes: list[dict]) -> dict:
+    """Compare arb frequency while games are live vs pregame."""
+    by_status: dict[str, dict] = {}
+    for status in STATUS_ORDER:
+        st_ticks = [tick for tick in ticks if game_status(tick) == status]
+        st_arbs = [tick for tick in st_ticks if tick.get("is_arb")]
+        st_eps = [row for row in arb_episodes if (row.get("status") or game_status(row)) == status]
+        if not st_ticks and not st_eps:
+            continue
+        by_status[status] = {
+            "ticks": len(st_ticks),
+            "arb_ticks": len(st_arbs),
+            "arb_rate": (len(st_arbs) / len(st_ticks)) if st_ticks else None,
+            "quoted_matches": len(unique_matches(st_ticks)),
+            "arb_matches": len(unique_matches(st_arbs)),
+            "episodes": st_eps,
+            "duration": duration_stats(st_eps),
+        }
+    return by_status
 
 
 def format_duration(seconds: float | None) -> str:
@@ -298,6 +344,7 @@ def analyze(db_path: Path | None = None) -> dict:
             for cents, episodes in by_cents.items()
         },
         "largest": match_rollups(arb_episodes)[:LARGEST_N],
+        "by_status": status_breakdown(ticks, arb_episodes),
     }
 
 
@@ -313,6 +360,20 @@ def print_report(report: dict) -> None:
         f"~{report['typical_poll_seconds']:.1f}s poll)"
     )
     print(f"Quoted matches: {report['quoted_matches']}   ticks: {report['ticks']}")
+    if report.get("by_status"):
+        print("Live vs pregame (arb tick rate = arb quotes / all quotes in that state):")
+        for status, bucket in report["by_status"].items():
+            rate = f"{bucket['arb_rate'] * 100:.1f}%" if bucket["arb_rate"] is not None else "n/a"
+            print(
+                f"  {status:<8}  {bucket['quoted_matches']} {_plural(bucket['quoted_matches'], 'match', 'matches')} quoted, "
+                f"{bucket['arb_matches']} with arbs, {bucket['arb_ticks']}/{bucket['ticks']} ticks ({rate})"
+            )
+            if bucket["duration"]["n"]:
+                stats = bucket["duration"]
+                print(
+                    f"           episodes n={stats['n']}  mean={format_duration(stats['mean'])}  "
+                    f"median={format_duration(stats['median'])}"
+                )
     print()
     print(
         f"Total arbs: {report['arb_matches']} {_plural(report['arb_matches'], 'match', 'matches')}, "
@@ -333,8 +394,10 @@ def print_report(report: dict) -> None:
         open_tag = "  still open" if row["still_open"] else ""
         trade = f"  {row['best_trade']}" if row.get("best_trade") else ""
         extra = f", {row['episodes']} episodes" if row.get("episodes", 1) > 1 else ""
+        status = row.get("status") or game_status(row)
+        live_tag = "  LIVE" if status == "live" else ""
         print(
-            f"  {format_cents(row['peak_edge']):>7}  {_game(row)}  "
+            f"  {format_cents(row['peak_edge']):>7}  {_game(row)}{live_tag}  "
             f"{format_duration(row['duration_seconds'])}  {row['ticks']} ticks{extra}{open_tag}{trade}"
         )
     print()
@@ -343,8 +406,9 @@ def print_report(report: dict) -> None:
         _print_duration(f">= {cents} cent arb duration", report["by_cents"][cents]["duration"], trailing_blank=False)
         for row in report["by_cents"][cents]["episodes"]:
             open_tag = "  still open" if row["still_open"] else ""
+            live_tag = "  LIVE" if (row.get("status") or game_status(row)) == "live" else ""
             print(
-                f"    {format_cents(row['peak_edge']):>7}  {_game(row)}  "
+                f"    {format_cents(row['peak_edge']):>7}  {_game(row)}{live_tag}  "
                 f"{format_duration(row['duration_seconds'])}  "
                 f"{format_ts(row['start'])} -> {format_ts(row['end'])}{open_tag}"
             )

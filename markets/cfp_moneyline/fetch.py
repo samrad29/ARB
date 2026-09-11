@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from datetime import datetime
 
-from util import KALSHI, POLY, get_json, maybe_json, parse_dt, parse_price
+from util import KALSHI, POLY, get_json, maybe_json, parse_dt, parse_price, poly_game_state
 
 SPORT = "cfb"
 LEVEL = "college"
@@ -77,6 +77,8 @@ def team_id(text: str | None) -> str | None:
 
 
 def _row(payload: dict) -> dict:
+    payload.setdefault("live", 0)
+    payload.setdefault("ended", 0)
     payload["sport"] = SPORT
     payload["level"] = LEVEL
     return payload
@@ -194,6 +196,7 @@ def _poly_event(event: dict) -> list[dict]:
     if date_from_slug:
         game_date = date_from_slug.group(1)
     volume = parse_price(moneyline.get("volume"))
+    state = poly_game_state(event)
     out = []
     for i, outcome in enumerate(outcomes):
         team = team_id(str(outcome))
@@ -218,6 +221,8 @@ def _poly_event(event: dict) -> list[dict]:
                     "close_time": close.isoformat() if close else "",
                     "game_date": game_date,
                     "url": f"https://polymarket.com/event/{slug}",
+                    "live": state["live"],
+                    "ended": state["ended"],
                 }
             )
         )

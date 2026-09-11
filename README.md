@@ -10,8 +10,8 @@ python -m polling.analysis   # arb counts, size buckets, and durations from pric
 
 `moneyline.db` tables:
 
-- `markets`, `matches`, `arbs` — current snapshot (`sport` is `nfl`/`cfb`, `level` is `pro`/`college`). Replaced on each discovery.
-- `price_ticks` — every poll quote, with `observed_at`
+- `markets`, `matches`, `arbs` — current snapshot (`sport` is `nfl`/`cfb`, `level` is `pro`/`college`). Replaced on each discovery. `live` / `ended` come from Polymarket at discovery and stay until the next discovery.
+- `price_ticks` — every poll quote, with `observed_at` and the discovery-time `live` / `ended` flags
 - `arb_history` — timestamped arb flags from discovery and polling (`source` is `discovery` or `poll`)
 
 ```sql
