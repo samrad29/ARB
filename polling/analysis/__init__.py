@@ -7,6 +7,7 @@ from .stats import (
     load_ticks,
     match_rollups,
     print_report,
+    sport_breakdown,
 )
 
 __all__ = [
@@ -18,4 +19,5 @@ __all__ = [
     "load_ticks",
     "match_rollups",
     "print_report",
+    "sport_breakdown",
 ]

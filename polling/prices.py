@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from util import KALSHI, POLY, get_json, maybe_json, parse_price
+from util import KALSHI, POLY, POLY_CLOB, get_json, maybe_json, parse_price
 from markets.nfl.fetch import team_id as nfl_team_id
 from markets.cfp_moneyline.fetch import team_id as cfb_team_id
 from markets.tennis import player_id as tennis_player_id
@@ -88,3 +88,66 @@ def poly_prices(market_id: str | None, sport: str, team_a: str, team_b: str) -> 
             yes_b = price
     closed = bool(market.get("closed")) or str(market.get("active")).lower() == "false"
     return {"yes_a": yes_a, "yes_b": yes_b, "closed": closed}
+
+
+def kalshi_yes_asks(ticker: str | None) -> list[tuple[float, float]]:
+    """YES asks for a Kalshi ticker: NO bid at P is a YES ask at $1 - P."""
+    if not ticker:
+        return []
+    try:
+        data = get_json(f"{KALSHI}/markets/{ticker}/orderbook")
+    except Exception:
+        return []
+    no_bids = _kalshi_bid_levels(data, "no")
+    asks = []
+    for bid_price, qty in no_bids:
+        ask_price = round(1.0 - bid_price, 4)
+        if ask_price > 0 and qty > 0:
+            asks.append((ask_price, qty))
+    asks.sort(key=lambda level: level[0])
+    return asks
+
+
+def poly_token_asks(token_id: str | None) -> list[tuple[float, float]]:
+    """Explicit asks from the Polymarket CLOB for one outcome token."""
+    if not token_id:
+        return []
+    try:
+        data = get_json(f"{POLY_CLOB}/book", {"token_id": token_id})
+    except Exception:
+        return []
+    asks = []
+    rows = data.get("asks") if isinstance(data, dict) else None
+    for level in rows or []:
+        price = parse_price(level.get("price") if isinstance(level, dict) else None)
+        qty = parse_price(level.get("size") if isinstance(level, dict) else None)
+        if price is None or qty is None or price <= 0 or qty <= 0:
+            continue
+        asks.append((price, qty))
+    asks.sort(key=lambda level: level[0])
+    return asks
+
+
+def _kalshi_bid_levels(data: dict, side: str) -> list[tuple[float, float]]:
+    fp = data.get("orderbook_fp") if isinstance(data, dict) else None
+    raw = None
+    dollars = False
+    if isinstance(fp, dict):
+        raw = fp.get(f"{side}_dollars")
+        dollars = True
+    if not raw:
+        book = data.get("orderbook") if isinstance(data, dict) else None
+        raw = book.get(side) if isinstance(book, dict) else None
+        dollars = False
+    levels = []
+    for item in raw or []:
+        if not item or len(item) < 2:
+            continue
+        price = parse_price(item[0])
+        qty = parse_price(item[1])
+        if price is None or qty is None or qty <= 0:
+            continue
+        if not dollars and price > 1:
+            price = price / 100.0
+        levels.append((price, qty))
+    return levels

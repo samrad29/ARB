@@ -11,6 +11,7 @@ from datetime import date, datetime, timezone
 
 KALSHI = "https://external-api.kalshi.com/trade-api/v2"
 POLY = "https://gamma-api.polymarket.com"
+POLY_CLOB = "https://clob.polymarket.com"
 
 
 def get_json(url: str, params: dict | None = None) -> dict | list:

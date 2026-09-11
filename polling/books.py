@@ -1,8 +1,9 @@
-"""Poll matched moneylines for live prices; rediscover markets about every 10 minutes.
+"""Poll live Kalshi / Polymarket order books for executable-at-snapshot arbs.
 
-Run:  python -m polling            # last-price quotes
-      python -m polling.books      # live order books
-      python -m polling --minutes 60
+Run:  python -m polling.books
+      python -m polling.books --minutes 60
+
+Last-price quotes stay on `python -m polling`.
 """
 
 from __future__ import annotations
@@ -13,8 +14,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
-from main import connect, discover, find_arbs
-from polling.prices import kalshi_prices, poly_prices
+from main import connect, discover, quote_executable
 from util import game_status
 
 TARGET_CYCLE_SECONDS = 8
@@ -41,37 +41,15 @@ def load_matches(conn: sqlite3.Connection) -> list[dict]:
     return [dict(row) for row in rows]
 
 
-def quote_match(match: dict) -> dict | None:
-    kalshi = kalshi_prices(match.get("kalshi_event_id"), match.get("kalshi_id_a"), match.get("kalshi_id_b"))
-    poly = poly_prices(match.get("poly_id"), match["sport"], match["team_a"], match["team_b"])
-    quoted = {
-        **match,
-        "kalshi_yes_a": kalshi["yes_a"],
-        "kalshi_yes_b": kalshi["yes_b"],
-        "poly_yes_a": poly["yes_a"],
-        "poly_yes_b": poly["yes_b"],
-        "closed": 1 if kalshi["closed"] or poly["closed"] else 0,
-    }
-    if None in (quoted["kalshi_yes_a"], quoted["kalshi_yes_b"], quoted["poly_yes_a"], quoted["poly_yes_b"]):
-        return quoted if quoted["closed"] else None
-    scored = find_arbs([quoted])
-    if not scored:
-        return quoted
-    row = scored[0]
-    row["closed"] = quoted["closed"]
-    row["live"] = quoted.get("live") or 0
-    row["ended"] = quoted.get("ended") or 0
-    return row
-
-
 def save_tick(conn: sqlite3.Connection, row: dict, observed_at: str) -> None:
     conn.execute(
         """
-        INSERT INTO price_ticks (
+        INSERT INTO book_ticks (
             observed_at, sport, level, game_date, team_a, team_b,
             kalshi_yes_a, poly_yes_a, kalshi_yes_b, poly_yes_b,
-            best_cost, best_edge, is_arb, best_trade, closed, live, ended
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            best_cost, best_edge, is_exec, best_trade, exec_qty, exec_profit,
+            live, ended
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             observed_at,
@@ -86,55 +64,37 @@ def save_tick(conn: sqlite3.Connection, row: dict, observed_at: str) -> None:
             row.get("poly_yes_b"),
             row.get("best_cost"),
             row.get("best_edge"),
-            row.get("is_arb") or 0,
+            row.get("is_exec") or 0,
             row.get("best_trade"),
-            row.get("closed") or 0,
+            row.get("exec_qty") or 0,
+            row.get("exec_profit") or 0,
             row.get("live") or 0,
             row.get("ended") or 0,
         ),
     )
-    if row.get("is_arb") and not row.get("closed"):
-        conn.execute(
-            """
-            INSERT INTO arb_history (
-                observed_at, source, sport, level, game_date, poly_game_date, team_a, team_b,
-                kalshi_event, polymarket_event, kalshi_yes_a, poly_yes_a, team_a_price_diff,
-                kalshi_yes_b, poly_yes_b, team_b_price_diff, kalshi_a_plus_poly_b, poly_a_plus_kalshi_b,
-                best_cost, best_edge, is_arb, best_trade, kalshi_url, polymarket_url, live, ended
-            ) VALUES (
-                :observed_at, :source, :sport, :level, :game_date, :poly_game_date, :team_a, :team_b,
-                :kalshi_event, :polymarket_event, :kalshi_yes_a, :poly_yes_a, :team_a_price_diff,
-                :kalshi_yes_b, :poly_yes_b, :team_b_price_diff, :kalshi_a_plus_poly_b, :poly_a_plus_kalshi_b,
-                :best_cost, :best_edge, :is_arb, :best_trade, :kalshi_url, :polymarket_url, :live, :ended
-            )
-            """,
-            {**row, "observed_at": observed_at, "source": "poll", "is_arb": 1,
-             "live": row.get("live") or 0, "ended": row.get("ended") or 0},
-        )
 
 
 def poll_once(conn: sqlite3.Connection) -> None:
-    matches = load_matches(conn)
+    matches = [row for row in load_matches(conn) if game_status(row) != "ended"]
     observed_at = utc_now()
     started = time.monotonic()
     hits = 0
     live_hits = 0
     pre_hits = 0
-    closed = 0
     quoted = 0
-    print(f"Polling {len(matches)} matches at {observed_at}...")
+    print(f"Polling books for {len(matches)} matches at {observed_at}...")
     rows: list[dict] = []
     with ThreadPoolExecutor(max_workers=QUOTE_WORKERS) as pool:
-        futures = [pool.submit(quote_match, match) for match in matches]
+        futures = [pool.submit(quote_executable, match) for match in matches]
         for future in as_completed(futures):
             row = future.result()
             if row is not None:
                 rows.append(row)
+    misses = []
     for row in rows:
         quoted += 1
-        if row.get("closed"):
-            closed += 1
-        if row.get("is_arb") and not row.get("closed"):
+        save_tick(conn, row, observed_at)
+        if row.get("is_exec"):
             hits += 1
             if game_status(row) == "live":
                 live_hits += 1
@@ -143,19 +103,31 @@ def poll_once(conn: sqlite3.Connection) -> None:
             tag = " LIVE" if game_status(row) == "live" else ""
             label = row["sport"] if row.get("sport") != "tennis" else f"tennis/{row.get('level')}"
             print(
-                f"  ARB [{label}]{tag} {row['team_a']} vs {row['team_b']}  "
-                f"{row.get('best_trade')}  cost={row.get('best_cost')} edge={row.get('best_edge')}"
+                f"  EXEC [{label}]{tag} {row['team_a']} vs {row['team_b']}  "
+                f"{row.get('best_trade')}  cost={row.get('best_cost')} "
+                f"size={row.get('exec_qty')} edge={row.get('best_edge')}  "
+                f"(executable at snapshot)"
             )
-        save_tick(conn, row, observed_at)
+        elif row.get("best_cost") is not None:
+            misses.append(row)
     conn.commit()
+    if not hits and misses:
+        misses.sort(key=lambda row: row["best_cost"])
+        print("  Closest (not executable at snapshot):")
+        for row in misses[:3]:
+            label = row["sport"] if row.get("sport") != "tennis" else f"tennis/{row.get('level')}"
+            print(
+                f"    [{label}] {row['team_a']} vs {row['team_b']}: "
+                f"{row.get('best_trade')}  cost={row.get('best_cost')}"
+            )
     print(
-        f"  quoted {quoted}, closed {closed}, arbs {hits} "
+        f"  quoted {quoted}, exec {hits} "
         f"({live_hits} live / {pre_hits} pregame) in {time.monotonic() - started:.1f}s"
     )
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Poll live prices; rediscover about every 10 minutes.")
+    parser = argparse.ArgumentParser(description="Poll live order books; rediscover about every 10 minutes.")
     parser.add_argument(
         "minutes",
         nargs="?",
@@ -186,7 +158,7 @@ def main() -> None:
     conn = connect()
     try:
         if args.minutes is not None:
-            print(f"Running for {args.minutes:g} minutes...")
+            print(f"Running book polling for {args.minutes:g} minutes...")
         print("Initial discovery...")
         discover(scan_books=False)
         last_discovery = time.monotonic()

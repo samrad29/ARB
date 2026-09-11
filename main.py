@@ -13,6 +13,7 @@ from pathlib import Path
 
 from util import game_status, parse_game_date
 from markets import cfp_moneyline, nfl, tennis
+from polling.prices import kalshi_yes_asks, poly_token_asks
 
 DB_PATH = Path(__file__).resolve().parent / "moneyline.db"
 DATE_WINDOW_DAYS = 1
@@ -104,6 +105,8 @@ def match_markets(
                 "kalshi_id_b": k_b.get("market_id"),
                 "poly_id": p_a.get("market_id") or p_b.get("market_id"),
                 "poly_event_id": p_game["meta"].get("event_id"),
+                "poly_token_a": p_a.get("token_id"),
+                "poly_token_b": p_b.get("token_id"),
                 "kalshi_yes_a": k_a.get("yes_price"),
                 "poly_yes_a": p_a.get("yes_price"),
                 "kalshi_yes_b": k_b.get("yes_price"),
@@ -152,6 +155,154 @@ def find_arbs(matches: list[dict]) -> list[dict]:
         )
     rows.sort(key=lambda row: row["best_edge"], reverse=True)
     return rows
+
+
+def walk_asks(asks_left: list[tuple[float, float]], asks_right: list[tuple[float, float]]) -> dict | None:
+    """Pair two ask books while the combined price stays under $1.00."""
+    left = [[price, qty] for price, qty in asks_left]
+    right = [[price, qty] for price, qty in asks_right]
+    i = 0
+    j = 0
+    total_qty = 0.0
+    total_cost = 0.0
+    while i < len(left) and j < len(right):
+        price_left, qty_left = left[i]
+        price_right, qty_right = right[j]
+        combined = round(price_left + price_right, 4)
+        if combined >= 1.0:
+            break
+        take = min(qty_left, qty_right)
+        total_qty += take
+        total_cost += take * combined
+        left[i][1] -= take
+        right[j][1] -= take
+        if left[i][1] <= 1e-9:
+            i += 1
+        if right[j][1] <= 1e-9:
+            j += 1
+    if total_qty <= 0:
+        return None
+    avg_cost = total_cost / total_qty
+    return {
+        "qty": total_qty,
+        "total_cost": total_cost,
+        "avg_cost": avg_cost,
+        "profit": total_qty - total_cost,
+        "edge": 1.0 - avg_cost,
+    }
+
+
+def scan_executable(matches: list[dict]) -> list[dict]:
+    """Fetch books for each match and score both buy directions."""
+    rows = []
+    open_matches = [match for match in matches if game_status(match) != "ended"]
+    print(f"Fetching order books for {len(open_matches)} matches...")
+    for n, match in enumerate(open_matches, 1):
+        kalshi_a = kalshi_yes_asks(match.get("kalshi_id_a"))
+        kalshi_b = kalshi_yes_asks(match.get("kalshi_id_b"))
+        poly_a = poly_token_asks(match.get("poly_token_a"))
+        poly_b = poly_token_asks(match.get("poly_token_b"))
+        rows.append(
+            _executable_direction(
+                match,
+                match["team_a"],
+                kalshi_a,
+                match["team_b"],
+                poly_b,
+            )
+        )
+        rows.append(
+            _executable_direction(
+                match,
+                match["team_b"],
+                kalshi_b,
+                match["team_a"],
+                poly_a,
+            )
+        )
+        if n % 25 == 0 or n == len(open_matches):
+            print(f"  {n}/{len(open_matches)}")
+    return [row for row in rows if row]
+
+
+def _executable_direction(
+    match: dict,
+    kalshi_team: str,
+    kalshi_asks: list[tuple[float, float]],
+    poly_team: str,
+    poly_asks: list[tuple[float, float]],
+) -> dict | None:
+    if not kalshi_asks or not poly_asks:
+        return None
+    walked = walk_asks(kalshi_asks, poly_asks)
+    kalshi_ask = kalshi_asks[0][0]
+    poly_ask = poly_asks[0][0]
+    combined = round(kalshi_ask + poly_ask, 4)
+    return {
+        "sport": match.get("sport"),
+        "level": match.get("level"),
+        "game_date": match.get("game_date"),
+        "team_a": match["team_a"],
+        "team_b": match["team_b"],
+        "live": match.get("live"),
+        "ended": match.get("ended"),
+        "direction": f"Buy {kalshi_team} on Kalshi + {poly_team} on Polymarket",
+        "kalshi_ask": kalshi_ask,
+        "poly_ask": poly_ask,
+        "combined_best": combined,
+        "qty": walked["qty"] if walked else 0.0,
+        "avg_cost": walked["avg_cost"] if walked else combined,
+        "profit": walked["profit"] if walked else 0.0,
+        "edge": walked["edge"] if walked else round(1.0 - combined, 4),
+        "is_exec": 1 if walked else 0,
+    }
+
+
+def quote_executable(match: dict) -> dict | None:
+    """Fetch live books for one match and score both buy directions."""
+    if game_status(match) == "ended":
+        return None
+    kalshi_a = kalshi_yes_asks(match.get("kalshi_id_a"))
+    kalshi_b = kalshi_yes_asks(match.get("kalshi_id_b"))
+    poly_a = poly_token_asks(match.get("poly_token_a"))
+    poly_b = poly_token_asks(match.get("poly_token_b"))
+    dir_a = _executable_direction(match, match["team_a"], kalshi_a, match["team_b"], poly_b)
+    dir_b = _executable_direction(match, match["team_b"], kalshi_b, match["team_a"], poly_a)
+    dirs = [row for row in (dir_a, dir_b) if row]
+    quoted = {
+        **match,
+        "kalshi_yes_a": kalshi_a[0][0] if kalshi_a else None,
+        "kalshi_yes_b": kalshi_b[0][0] if kalshi_b else None,
+        "poly_yes_a": poly_a[0][0] if poly_a else None,
+        "poly_yes_b": poly_b[0][0] if poly_b else None,
+        "closed": 0,
+        "is_exec": 0,
+        "is_arb": 0,
+        "exec_qty": 0.0,
+        "exec_profit": 0.0,
+        "best_cost": None,
+        "best_edge": None,
+        "best_trade": None,
+    }
+    if not dirs:
+        if None in (quoted["kalshi_yes_a"], quoted["kalshi_yes_b"], quoted["poly_yes_a"], quoted["poly_yes_b"]):
+            return None
+        return quoted
+    best = max(dirs, key=lambda row: (row["is_exec"], row["edge"]))
+    quoted["best_trade"] = best["direction"]
+    quoted["live"] = match.get("live") or 0
+    quoted["ended"] = match.get("ended") or 0
+    if best["is_exec"]:
+        quoted["is_exec"] = 1
+        quoted["is_arb"] = 1
+        quoted["best_cost"] = round(best["avg_cost"], 4)
+        quoted["best_edge"] = round(best["edge"], 4)
+        quoted["exec_qty"] = best["qty"]
+        quoted["exec_profit"] = best["profit"]
+    else:
+        quoted["best_cost"] = round(best["combined_best"], 4)
+        quoted["best_edge"] = round(1.0 - best["combined_best"], 4)
+    return quoted
 
 
 def _add_columns(conn: sqlite3.Connection, table: str, columns: list[tuple[str, str]]) -> None:
@@ -279,11 +430,33 @@ def connect() -> sqlite3.Connection:
             live INTEGER,
             ended INTEGER
         );
+        CREATE TABLE IF NOT EXISTS book_ticks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            observed_at TEXT NOT NULL,
+            sport TEXT,
+            level TEXT,
+            game_date TEXT,
+            team_a TEXT,
+            team_b TEXT,
+            kalshi_yes_a REAL,
+            poly_yes_a REAL,
+            kalshi_yes_b REAL,
+            poly_yes_b REAL,
+            best_cost REAL,
+            best_edge REAL,
+            is_exec INTEGER,
+            best_trade TEXT,
+            exec_qty REAL,
+            exec_profit REAL,
+            live INTEGER,
+            ended INTEGER
+        );
         CREATE INDEX IF NOT EXISTS idx_markets_sport ON markets (sport, level);
         CREATE INDEX IF NOT EXISTS idx_matches_sport ON matches (sport, level);
         CREATE INDEX IF NOT EXISTS idx_arbs_sport ON arbs (sport, level, is_arb, best_edge);
         CREATE INDEX IF NOT EXISTS idx_price_ticks_time ON price_ticks (observed_at);
         CREATE INDEX IF NOT EXISTS idx_arb_history_time ON arb_history (observed_at, is_arb);
+        CREATE INDEX IF NOT EXISTS idx_book_ticks_time ON book_ticks (observed_at, is_exec);
         """
     )
     _add_columns(
@@ -295,9 +468,11 @@ def connect() -> sqlite3.Connection:
             ("kalshi_id_b", "TEXT"),
             ("poly_id", "TEXT"),
             ("poly_event_id", "TEXT"),
+            ("poly_token_a", "TEXT"),
+            ("poly_token_b", "TEXT"),
         ],
     )
-    for table in ("markets", "matches", "arbs", "price_ticks", "arb_history"):
+    for table in ("markets", "matches", "arbs", "price_ticks", "arb_history", "book_ticks"):
         _add_columns(conn, table, [("live", "INTEGER"), ("ended", "INTEGER")])
     return conn
 
@@ -323,6 +498,8 @@ def save_db(markets: list[dict], matches: list[dict], arbs: list[dict]) -> None:
     for row in matches:
         row.setdefault("live", 0)
         row.setdefault("ended", 0)
+        row.setdefault("poly_token_a", None)
+        row.setdefault("poly_token_b", None)
     for row in arbs:
         row.setdefault("live", 0)
         row.setdefault("ended", 0)
@@ -350,11 +527,13 @@ def save_db(markets: list[dict], matches: list[dict], arbs: list[dict]) -> None:
             INSERT INTO matches (
                 sport, level, game_date, poly_game_date, team_a, team_b, kalshi_event, polymarket_event,
                 kalshi_event_id, kalshi_id_a, kalshi_id_b, poly_id, poly_event_id,
+                poly_token_a, poly_token_b,
                 kalshi_yes_a, poly_yes_a, kalshi_yes_b, poly_yes_b, kalshi_url, polymarket_url,
                 live, ended
             ) VALUES (
                 :sport, :level, :game_date, :poly_game_date, :team_a, :team_b, :kalshi_event, :polymarket_event,
                 :kalshi_event_id, :kalshi_id_a, :kalshi_id_b, :poly_id, :poly_event_id,
+                :poly_token_a, :poly_token_b,
                 :kalshi_yes_a, :poly_yes_a, :kalshi_yes_b, :poly_yes_b, :kalshi_url, :polymarket_url,
                 :live, :ended
             )
@@ -433,7 +612,58 @@ def print_summary(markets: list[dict], matches: list[dict], arbs: list[dict]) ->
         print("No pre-fee arbs this run (best edges are in the arbs table).")
 
 
-def discover() -> tuple[list[dict], list[dict], list[dict]]:
+def _cents(price: float) -> str:
+    cents = price * 100
+    if abs(cents - round(cents)) < 0.05:
+        return f"{int(round(cents))}c"
+    return f"{cents:.1f}c"
+
+
+def _size(qty: float) -> str:
+    if abs(qty - round(qty)) < 1e-6:
+        return str(int(round(qty)))
+    return f"{qty:.2f}"
+
+
+def print_executable(rows: list[dict]) -> None:
+    hits = [row for row in rows if row.get("is_exec")]
+    hits.sort(key=lambda row: row["edge"], reverse=True)
+    print()
+    print("Executable at snapshot (gross, no fees; not guaranteed arbitrage):")
+    if not hits:
+        print("  none")
+    for row in hits:
+        tag = " LIVE" if game_status(row) == "live" else ""
+        print()
+        print(f"GAME: {row['team_a']} vs {row['team_b']}{tag}")
+        print(f"Direction: {row['direction']}")
+        print()
+        print(f"Kalshi ask: {_cents(row['kalshi_ask'])}")
+        print(f"Polymarket ask: {_cents(row['poly_ask'])}")
+        print(f"Combined cost: {_cents(row['combined_best'])}")
+        if abs(row["avg_cost"] - row["combined_best"]) >= 0.0005:
+            print(f"Avg combined cost: {_cents(row['avg_cost'])}")
+        print(f"Max size: {_size(row['qty'])}")
+        print(f"Gross edge: {_cents(row['edge'])}")
+        print(f"Gross profit: ${row['profit']:.2f}")
+
+    misses = [row for row in rows if not row.get("is_exec")]
+    misses.sort(key=lambda row: row["combined_best"])
+    print()
+    print("Closest (not executable at snapshot):")
+    if not misses:
+        print("  none")
+        return
+    for row in misses[:5]:
+        label = row["sport"] if row.get("sport") != "tennis" else f"tennis/{row.get('level')}"
+        print(
+            f"  [{label}] {row['team_a']} vs {row['team_b']}: "
+            f"Kalshi {_cents(row['kalshi_ask'])} + Poly {_cents(row['poly_ask'])} "
+            f"= {_cents(row['combined_best'])}"
+        )
+
+
+def discover(scan_books: bool = True) -> tuple[list[dict], list[dict], list[dict]]:
     all_markets: list[dict] = []
     all_matches: list[dict] = []
     all_arbs: list[dict] = []
@@ -457,6 +687,8 @@ def discover() -> tuple[list[dict], list[dict], list[dict]]:
         all_arbs.extend(arbs)
     save_db(all_markets, all_matches, all_arbs)
     print_summary(all_markets, all_matches, all_arbs)
+    if scan_books:
+        print_executable(scan_executable(all_matches))
     return all_markets, all_matches, all_arbs
 
 

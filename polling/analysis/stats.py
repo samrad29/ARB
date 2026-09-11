@@ -17,9 +17,11 @@ from util import game_status, parse_dt
 
 CENT = 0.01
 CENT_THRESHOLDS = (1, 2, 3)
-LARGEST_N = 12
+LARGEST_N = 5
 SESSION_GAP_SECONDS = 15 * 60
 STATUS_ORDER = ("live", "pregame", "ended", "unknown")
+SPORT_ORDER = ("nfl", "cfb", "tennis")
+TENNIS_LEVELS = ("atp", "wta", "itf", "challenger")
 
 
 def load_ticks(conn: sqlite3.Connection) -> list[dict]:
@@ -267,6 +269,46 @@ def status_breakdown(ticks: list[dict], arb_episodes: list[dict]) -> dict:
     return by_status
 
 
+def _bucket_for(ticks: list[dict], arb_episodes: list[dict]) -> dict:
+    arb_ticks = [tick for tick in ticks if tick.get("is_arb")]
+    return {
+        "ticks": len(ticks),
+        "arb_ticks": len(arb_ticks),
+        "arb_rate": (len(arb_ticks) / len(ticks)) if ticks else None,
+        "quoted_matches": len(unique_matches(ticks)),
+        "arb_matches": len(unique_matches(arb_ticks)),
+        "episodes": arb_episodes,
+        "duration": duration_stats(arb_episodes),
+    }
+
+
+def sport_breakdown(ticks: list[dict], arb_episodes: list[dict]) -> dict:
+    """Compare arb frequency by sport (and tennis tour)."""
+    sports = {tick.get("sport") for tick in ticks if tick.get("sport")}
+    ordered = [sport for sport in SPORT_ORDER if sport in sports]
+    ordered.extend(sorted(sports - set(SPORT_ORDER)))
+    by_sport: dict[str, dict] = {}
+    for sport in ordered:
+        st_ticks = [tick for tick in ticks if tick.get("sport") == sport]
+        st_eps = [row for row in arb_episodes if row.get("sport") == sport]
+        if not st_ticks and not st_eps:
+            continue
+        bucket = _bucket_for(st_ticks, st_eps)
+        if sport == "tennis":
+            levels = {tick.get("level") for tick in st_ticks if tick.get("level")}
+            level_order = [level for level in TENNIS_LEVELS if level in levels]
+            level_order.extend(sorted(levels - set(TENNIS_LEVELS)))
+            by_level = {}
+            for level in level_order:
+                lv_ticks = [tick for tick in st_ticks if tick.get("level") == level]
+                lv_eps = [row for row in st_eps if row.get("level") == level]
+                if lv_ticks or lv_eps:
+                    by_level[level] = _bucket_for(lv_ticks, lv_eps)
+            bucket["by_level"] = by_level
+        by_sport[sport] = bucket
+    return by_sport
+
+
 def format_duration(seconds: float | None) -> str:
     if seconds is None:
         return "n/a"
@@ -347,6 +389,7 @@ def analyze(db_path: Path | None = None) -> dict:
         },
         "largest": match_rollups(arb_episodes)[:LARGEST_N],
         "by_status": status_breakdown(ticks, arb_episodes),
+        "by_sport": sport_breakdown(ticks, arb_episodes),
     }
 
 
@@ -381,6 +424,13 @@ def print_report(report: dict) -> None:
         f"Total arbs: {report['arb_matches']} {_plural(report['arb_matches'], 'match', 'matches')}, "
         f"{len(report['arb_episodes'])} {_plural(len(report['arb_episodes']), 'episode')}  (edge > 0)"
     )
+    if report.get("by_sport"):
+        print("By sport:")
+        for sport, bucket in report["by_sport"].items():
+            _print_sport_bucket(sport, bucket)
+            for level, sub in (bucket.get("by_level") or {}).items():
+                _print_sport_bucket(level, sub, indent="    ")
+        print()
     print("How many were >1 / >2 / >3 cents (peak edge, inclusive):")
     for cents, bucket in report["by_cents"].items():
         n_ep = len(bucket["episodes"])
@@ -389,24 +439,24 @@ def print_report(report: dict) -> None:
             f"{n_ep} {_plural(n_ep, 'episode')}"
         )
     print()
-    print("Largest arbs:")
+    print(f"Largest arbs (top {len(report['largest'])}):")
     if not report["largest"]:
         print("  none")
     for row in report["largest"]:
         open_tag = "  still open" if row["still_open"] else ""
-        trade = f"  {row['best_trade']}" if row.get("best_trade") else ""
         extra = f", {row['episodes']} episodes" if row.get("episodes", 1) > 1 else ""
         status = row.get("status") or game_status(row)
         live_tag = "  LIVE" if status == "live" else ""
         print(
             f"  {format_cents(row['peak_edge']):>7}  {_game(row)}{live_tag}  "
-            f"{format_duration(row['duration_seconds'])}  {row['ticks']} ticks{extra}{open_tag}{trade}"
+            f"{format_duration(row['duration_seconds'])}  {row['ticks']} ticks{extra}{open_tag}"
         )
     print()
     _print_duration("Average arb duration (all edge > 0 episodes)", report["arb_duration"])
     for cents in (2, 3):
+        episodes = report["by_cents"][cents]["episodes"]
         _print_duration(f">= {cents} cent arb duration", report["by_cents"][cents]["duration"], trailing_blank=False)
-        for row in report["by_cents"][cents]["episodes"]:
+        for row in episodes[:LARGEST_N]:
             open_tag = "  still open" if row["still_open"] else ""
             live_tag = "  LIVE" if (row.get("status") or game_status(row)) == "live" else ""
             print(
@@ -414,7 +464,18 @@ def print_report(report: dict) -> None:
                 f"{format_duration(row['duration_seconds'])}  "
                 f"{format_ts(row['start'])} -> {format_ts(row['end'])}{open_tag}"
             )
+        extra = len(episodes) - LARGEST_N
+        if extra > 0:
+            print(f"    ... {extra} more")
         print()
+
+
+def _print_sport_bucket(label: str, bucket: dict, indent: str = "  ") -> None:
+    rate = f"{bucket['arb_rate'] * 100:.1f}%" if bucket["arb_rate"] is not None else "n/a"
+    print(
+        f"{indent}{label:<12}  {bucket['quoted_matches']} {_plural(bucket['quoted_matches'], 'match', 'matches')} quoted, "
+        f"{bucket['arb_matches']} with arbs, {bucket['arb_ticks']}/{bucket['ticks']} ticks ({rate})"
+    )
 
 
 def _print_duration(title: str, stats: dict, trailing_blank: bool = True) -> None:

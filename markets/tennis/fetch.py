@@ -142,6 +142,9 @@ def _poly_event(event: dict, level: str) -> list[dict]:
         return []
     outcomes = maybe_json(moneyline.get("outcomes")) or []
     prices = maybe_json(moneyline.get("outcomePrices")) or []
+    tokens = maybe_json(moneyline.get("clobTokenIds"))
+    if not isinstance(tokens, list):
+        tokens = []
     close = parse_dt(moneyline.get("endDate") or event.get("endDate") or event.get("startDate"))
     game_date = close.date().isoformat() if close else ""
     date_from_slug = re.search(r"(\d{4}-\d{2}-\d{2})$", slug)
@@ -166,6 +169,7 @@ def _poly_event(event: dict, level: str) -> list[dict]:
                 {
                     "exchange": "polymarket",
                     "market_id": moneyline.get("id") or moneyline.get("slug") or slug,
+                    "token_id": str(tokens[i]) if i < len(tokens) and tokens[i] else None,
                     "event_id": slug,
                     "event_title": title,
                     "team": team,
