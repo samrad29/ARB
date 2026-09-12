@@ -1,6 +1,7 @@
 """Summarize polling arb ticks: counts, size, and how long they lasted.
 
-Run:  python -m polling.analysis
+Run:  python -m polling.analysis              # last-price quotes
+      python -m polling.analysis.books        # order-book / executable snapshots
       python -m polling.analysis path/to/moneyline.db
 """
 
